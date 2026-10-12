@@ -1,8 +1,13 @@
-## Unreleased
+## v0.2.0 (2026-10-12)
 
 ### Feat
 
+- **validation**: validate objects against declared STAC extension schemas (#159)
 - **live**: probe every link target under `--live-base-url` and report a document the publish host does not serve as `PTL-LIV-006` (#189)
+
+### Fix
+
+- **deps**: lock urllib3 2.8.0 and virtualenv 21.14.5 (#211)
 
 ## v0.1.8 (2026-08-28)
 
