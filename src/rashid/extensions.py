@@ -35,9 +35,11 @@ from typing import Any
 
 from rashid._jsonschema import (
     SchemaError,
-    describe,
+    compile_rust,
     extension_registry,
+    extension_rust_registry,
     fetch_schema,
+    screened,
     vendored_extension_schemas,
 )
 from rashid.catalog import CatalogGraph, Kind, Node
@@ -85,10 +87,16 @@ def _compile(schema: dict[str, Any]) -> Any:
     roots are spec-driven and a future one need not be. Hardcoding the dialect
     is the bug stac-check #159 reports upstream; there is no reason to repeat
     it here.
+
+    The result is :func:`rashid._jsonschema.screened`: ``jsonschema-rs``
+    passes a valid object, and ``jsonschema`` explains a rejected one.
     """
     from jsonschema.validators import validator_for
 
-    return validator_for(schema)(schema, registry=extension_registry())
+    return screened(
+        validator_for(schema)(schema, registry=extension_registry()),
+        compile_rust(schema, extension_rust_registry()),
+    )
 
 
 def default_validator(*, allow_network: bool = False) -> Validator:
@@ -127,11 +135,11 @@ def default_validator(*, allow_network: bool = False) -> Validator:
                     raise SchemaUnavailable(str(exc)) from exc
             validator = compiled[schema_uri] = _compile(schema)
         try:
-            errors = sorted(validator.iter_errors(data), key=str)
+            errors: list[SchemaError] = validator(data)
         except Unresolvable as exc:
             failed[schema_uri] = f"unresolvable $ref: {exc}"
             raise SchemaUnavailable(failed[schema_uri]) from exc
-        return [describe(error) for error in errors]
+        return errors
 
     return _validate
 

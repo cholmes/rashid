@@ -118,18 +118,17 @@ def validator_from_schema(schema: dict[str, Any]) -> Validator:
     ``jsonschema`` is imported lazily because the metadata pass never needs it.
     Draft-07 is pinned because the published Portolan schema declares
     ``$schema`` draft-07. Error narrowing (the oneOf discriminator dance) lives
-    in :func:`rashid._jsonschema.describe`, shared with the structural pass.
+    in :func:`rashid._jsonschema.describe`, shared with the structural pass,
+    and :func:`rashid._jsonschema.screened` skips it for a valid object.
     """
     from jsonschema import Draft7Validator
 
-    from rashid._jsonschema import describe
+    from rashid._jsonschema import compile_rust, screened, specifications_rust_registry
 
-    validator = Draft7Validator(schema)
-
-    def _validate(data: dict[str, Any]) -> list[SchemaError]:
-        return [describe(error) for error in sorted(validator.iter_errors(data), key=str)]
-
-    return _validate
+    return screened(
+        Draft7Validator(schema),
+        compile_rust(schema, specifications_rust_registry(), draft7=True),
+    )
 
 
 def default_validator(
