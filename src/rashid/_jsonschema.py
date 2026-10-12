@@ -23,13 +23,13 @@ same verdict on every fixture.
 
 from __future__ import annotations
 
-import json
-import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import resources
 from typing import TYPE_CHECKING, Any
+
+from rashid import _json
 
 if TYPE_CHECKING:
     from importlib.abc import Traversable
@@ -60,18 +60,14 @@ def fetch_schema(schema_uri: str) -> dict[str, Any]:
     that originated in a catalog's ``stac_extensions``. Only https is allowed:
     a ``file://`` or custom scheme would let a hostile catalog read local files
     or reach internal hosts (CWE-22 / SSRF). The named agent is sent for the
-    same reason the live pass sends one — a schema behind a CDN may answer the
-    default Python-urllib agent with a 403.
+    same reason the live pass sends one — a schema behind a CDN may answer an
+    anonymous agent with a 403.
     """
-    from rashid._http import user_agent
+    from rashid import _store
 
     if not schema_uri.startswith("https://"):
         raise ValueError(f"schema URI must be an https URL, got: {schema_uri!r}")
-    request = urllib.request.Request(  # noqa: S310  # nosec B310 - scheme checked above
-        schema_uri, headers={"User-Agent": user_agent()}
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310  # nosec B310 - scheme checked above
-        schema: dict[str, Any] = json.loads(response.read().decode("utf-8"))
+    schema: dict[str, Any] = _json.loads(_store.get(schema_uri))
     return schema
 
 
@@ -115,7 +111,7 @@ def _vendored_resources(
     for root, base in trees:
         for rel_path, text in _iter_vendored(root):
             url = f"{base}{rel_path}"
-            contents: dict[str, Any] = json.loads(text)
+            contents: dict[str, Any] = _json.loads(text)
             contents["$id"] = url
             out.append((url, contents))
     return out
@@ -257,7 +253,7 @@ def vendored_extension_schemas() -> dict[str, dict[str, Any]]:
         if not host_dir.is_dir():
             continue
         for rel_path, text in _iter_vendored(host_dir):
-            out[f"https://{host_dir.name}/{rel_path}"] = json.loads(text)
+            out[f"https://{host_dir.name}/{rel_path}"] = _json.loads(text)
     return out
 
 

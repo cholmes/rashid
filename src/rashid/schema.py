@@ -25,12 +25,12 @@ substitute their own.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from functools import lru_cache
 from importlib import resources
 from typing import Any
 
+from rashid import _json
 from rashid._jsonschema import SchemaError, fetch_schema
 from rashid.catalog import CatalogGraph, Kind
 from rashid.model import Finding, Severity
@@ -94,7 +94,7 @@ def _bundled_schemas() -> dict[str, dict[str, Any]]:
         schema_file = version_dir.joinpath("schema.json")
         if not schema_file.is_file():
             continue
-        schema: dict[str, Any] = json.loads(schema_file.read_text(encoding="utf-8"))
+        schema: dict[str, Any] = _json.loads(schema_file.read_bytes())
         schemas[str(schema["$id"]).rstrip("#")] = schema
     return schemas
 

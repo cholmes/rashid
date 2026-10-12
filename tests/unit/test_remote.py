@@ -13,11 +13,11 @@ import json
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote
-from urllib.request import Request
 
 import pytest
 from click.testing import CliRunner
 
+from rashid import remote as remote_mod
 from rashid import validate
 from rashid.catalog import CatalogGraph
 from rashid.cli import main
@@ -25,17 +25,17 @@ from rashid.data.reader import FilesystemHttpReader, LocalOnlyReader
 from rashid.live import LIV_LINK_TARGET, LIV_SELF_BASE, LIV_UNAVAILABLE
 from rashid.model import Severity
 from rashid.remote import (
-    MAX_BODY_BYTES,
     Crawl,
     Fetched,
     FetchError,
-    _UrllibFetcher,
+    _StoreFetcher,
     crawl,
     is_catalog_url,
     split_catalog_url,
     wire_url,
 )
 from rashid.runner import GEN_MISSING_ROOT, GEN_PARTIAL_TREE
+from tests._https import HttpsServer, Route
 from tests.conftest import CatalogBuilder, mutate_json
 from tests.unit.test_live import FakeProber, StatusProber
 
@@ -785,93 +785,80 @@ def test_cli_help_names_the_url_form() -> None:
 
 def test_default_fetcher_refuses_non_https() -> None:
     with pytest.raises(ValueError, match="https"):
-        _UrllibFetcher().get("http://h/catalog.json")
+        _StoreFetcher().get("http://h/catalog.json")
 
 
-def test_default_fetcher_sends_a_named_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
-    requests: list[Request] = []
+def test_default_fetcher_sends_a_named_user_agent(https_server: HttpsServer) -> None:
+    https_server.routes["/catalog.json"] = Route(body=b"{}")
 
-    class _Response:
-        status = 200
+    fetched = _StoreFetcher().get(https_server.url("catalog.json"))
 
-        def __enter__(self) -> _Response:
-            return self
-
-        def __exit__(self, *exc: object) -> None:
-            return None
-
-        def read(self, n: int = -1) -> bytes:
-            return b"{}"
-
-    def fake_urlopen(request: Request, **_kwargs: Any) -> _Response:
-        requests.append(request)
-        return _Response()
-
-    fetcher = _UrllibFetcher()
-    monkeypatch.setattr(fetcher._opener, "open", fake_urlopen)
-    fetched = fetcher.get(_ROOT_URL)
     assert fetched == Fetched(status=200, body=b"{}")
-    agent = requests[0].get_header("User-agent")
-    assert agent is not None and agent.startswith("rashid/")
+    assert https_server.seen[0].headers["user-agent"].startswith("rashid/")
 
 
-def test_default_fetcher_turns_http_errors_into_statuses(monkeypatch: pytest.MonkeyPatch) -> None:
-    from urllib.error import HTTPError
-
-    def fake_urlopen(request: Request, **_kwargs: Any) -> None:
-        raise HTTPError(_ROOT_URL, 404, "Not Found", None, None)  # type: ignore[arg-type]
-
-    fetcher = _UrllibFetcher()
-    monkeypatch.setattr(fetcher._opener, "open", fake_urlopen)
-    assert fetcher.get(_ROOT_URL) == Fetched(status=404)
-
-
-def test_default_fetcher_raises_fetch_error_without_a_status(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("status", [403, 404, 500])
+def test_default_fetcher_turns_http_errors_into_statuses(
+    https_server: HttpsServer, status: int
 ) -> None:
-    from urllib.error import URLError
+    https_server.routes["/catalog.json"] = Route(status=status)
 
-    def fake_urlopen(request: Request, **_kwargs: Any) -> None:
-        raise URLError("name or service not known")
-
-    fetcher = _UrllibFetcher()
-    monkeypatch.setattr(fetcher._opener, "open", fake_urlopen)
-    with pytest.raises(FetchError, match="name or service not known"):
-        fetcher.get(_ROOT_URL)
+    assert _StoreFetcher().get(https_server.url("catalog.json")) == Fetched(status=status)
 
 
-def test_default_fetcher_refuses_a_redirect_to_http() -> None:
-    from rashid.remote import _HttpsOnlyRedirects
+def test_default_fetcher_raises_fetch_error_without_a_status() -> None:
+    import socket
 
-    handler = _HttpsOnlyRedirects()
-    req = Request(_ROOT_URL)
-    with pytest.raises(FetchError, match="non-https"):
-        handler.redirect_request(req, None, 301, "Moved", {}, "http://h/catalog.json")
-    followed = handler.redirect_request(req, None, 301, "Moved", {}, "https://h2/catalog.json")
-    assert followed is not None and followed.full_url == "https://h2/catalog.json"
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    with pytest.raises(FetchError, match=f"GET https://127.0.0.1:{port}/catalog.json"):
+        _StoreFetcher().get(f"https://127.0.0.1:{port}/catalog.json")
 
 
-def test_default_fetcher_caps_the_body(monkeypatch: pytest.MonkeyPatch) -> None:
-    class _Response:
-        status = 200
+def test_default_fetcher_refuses_a_redirect_to_http(https_server: HttpsServer) -> None:
+    https_server.routes["/catalog.json"] = Route(
+        status=301, headers={"Location": "http://127.0.0.1:9/catalog.json"}
+    )
+    https_server.routes["/moved.json"] = Route(status=301, headers={"Location": "/catalog2.json"})
+    https_server.routes["/catalog2.json"] = Route(body=b"{}")
 
-        def __enter__(self) -> _Response:
-            return self
+    with pytest.raises(FetchError, match="redirect"):
+        _StoreFetcher().get(https_server.url("catalog.json"))
+    assert _StoreFetcher().get(https_server.url("moved.json")) == Fetched(status=200, body=b"{}")
 
-        def __exit__(self, *exc: object) -> None:
-            return None
 
-        def read(self, n: int = -1) -> bytes:
-            return b"x" * n
+def test_default_fetcher_caps_the_body(
+    https_server: HttpsServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(remote_mod, "MAX_BODY_BYTES", 8)
+    https_server.routes["/catalog.json"] = Route(body=b"x" * 9)
 
-    class _Opener:
-        def open(self, request: Request, **_kwargs: Any) -> _Response:
-            return _Response()
+    with pytest.raises(FetchError, match="exceeds 8"):
+        _StoreFetcher().get(https_server.url("catalog.json"))
 
-    fetcher = _UrllibFetcher()
-    monkeypatch.setattr(fetcher, "_opener", _Opener())
-    with pytest.raises(FetchError, match=f"exceeds {MAX_BODY_BYTES}"):
-        fetcher.get(_ROOT_URL)
+
+def test_default_fetcher_crawls_a_served_tree(
+    catalog: CatalogBuilder, https_server: HttpsServer, tmp_path: Path
+) -> None:
+    """The whole crawl against a real server: every document, and one missing child."""
+    catalog.collection("roads")
+    catalog.collection("rivers")
+    root = catalog.write()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        rel = path.relative_to(root).as_posix()
+        https_server.routes[f"/{rel}"] = Route(body=path.read_bytes())
+    missing = next(r for r in https_server.routes if r.endswith("collection.json"))
+    del https_server.routes[missing]
+    base = https_server.url("")
+
+    result = crawl(base, tmp_path / "tree")
+
+    assert result.statuses[f"{base}{missing.lstrip('/')}"] == 404
+    assert result.errors == {}
+    fetched = {p.relative_to(tmp_path / "tree").as_posix() for p in (tmp_path / "tree").rglob("*")}
+    assert "catalog.json" in fetched
+    assert missing.lstrip("/") not in fetched
 
 
 def test_crawl_result_is_a_plain_record() -> None:

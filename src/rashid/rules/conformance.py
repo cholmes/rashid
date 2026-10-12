@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable
 from functools import lru_cache
 from importlib import resources
 from typing import Any
 
+from rashid import _json
 from rashid.catalog import CatalogGraph, Node
 from rashid.model import Finding, Severity
 from rashid.rule import Rule
@@ -171,7 +171,7 @@ _EXTENSION_URI_PATTERN = re.compile(
 def _registry() -> dict[str, tuple[str, str]]:
     """Registered extensions, keyed by base URI: base -> (name, pinned version)."""
     resource = resources.files("rashid").joinpath(_REGISTRY_RESOURCE)
-    document: dict[str, Any] = json.loads(resource.read_text(encoding="utf-8"))
+    document: dict[str, Any] = _json.loads(resource.read_bytes())
     registered: dict[str, tuple[str, str]] = {}
     for name, uri in document["extensions"].items():
         parsed = _EXTENSION_URI_PATTERN.match(str(uri))
