@@ -33,9 +33,9 @@ run once per distinct host (via its lexically first asset); only the cheap HEAD
 runs per asset. Absolute ``https`` hrefs are probed as declared; relative
 hrefs are probed when the caller supplies ``base_url`` — the URL the catalog
 root is published under — by joining the root-relative asset path onto it.
-``s3`` and friends are ``PTL-AST-002``'s domain. The pass is stdlib-only and
-lives in core; like every optional pass it degrades to ``PTL-LIV-000``
-warnings when it cannot probe rather than failing the run.
+``s3`` and friends are ``PTL-AST-002``'s domain. The pass needs no geospatial
+stack and lives in core; like every optional pass it degrades to
+``PTL-LIV-000`` warnings when it cannot probe rather than failing the run.
 
 Given ``base_url`` the pass also asks whether the documents behind the
 catalog's **links** exist on the publish host (``PTL-LIV-006``). core.md,
@@ -57,12 +57,14 @@ from __future__ import annotations
 
 import posixpath
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from rashid import _store
 from rashid._http import user_agent
 from rashid.catalog import CatalogGraph, Kind, Node, is_absolute_href
 from rashid.model import Finding, Severity
@@ -109,6 +111,9 @@ _LINK_KINDS: tuple[Kind, ...] = ("catalog", "collection", "item")
 
 _TIMEOUT = 30  # seconds per request
 
+# Concurrent HEADs against one host.
+_WORKERS = 32
+
 # An arbitrary origin: a read-permitting CORS policy answers any origin, and a
 # restrictive one will not match this, correctly failing the check.
 _PROBE_ORIGIN = "https://rashid-live-probe.invalid"
@@ -149,7 +154,12 @@ class ProbeResponse:
 
 
 class Prober(Protocol):
-    """Issues the three probe requests against one URL."""
+    """Issues the three probe requests against one URL.
+
+    :meth:`head` runs on up to ``_WORKERS`` threads at once, one URL each, so
+    an implementation must be safe to call concurrently. :meth:`get_range`
+    and :meth:`preflight` run on the calling thread only.
+    """
 
     def get_range(self, url: str) -> ProbeResponse:
         """GET with ``Range: bytes=0-0`` and an ``Origin`` header."""
@@ -204,14 +214,33 @@ def _request(url: str, method: str, headers: dict[str, str]) -> ProbeResponse:
         return ProbeResponse(status=exc.code, headers=_lower_headers(exc.headers.items()))
 
 
-class _UrllibProber:
-    """The default prober: stdlib urllib, https only."""
+class _DefaultProber:
+    """The default prober, https only.
+
+    The ranged GET and the preflight run once per host and read response
+    headers that obstore does not return, so they go out over urllib. The HEADs
+    run once per asset and per link, so they go out over obstore, which reuses
+    one connection pool per host. obstore answers a HEAD with the size alone.
+
+    When the host answers but obstore does not return the answer, the HEAD is
+    sent again over urllib, so the checks read the full response exactly as
+    before. That covers a non-2xx status, whose headers ``_check_head`` still
+    reads, a missing ``Content-Length``, and a redirect off https. A transport
+    failure is not sent again: it marks the host dead, and asking twice only
+    doubles the wait.
+    """
 
     def get_range(self, url: str) -> ProbeResponse:
         return _request(url, "GET", {"Range": "bytes=0-0", "Origin": _PROBE_ORIGIN})
 
     def head(self, url: str) -> ProbeResponse:
-        return _request(url, "HEAD", {"Origin": _PROBE_ORIGIN})
+        try:
+            size = _store.head_size(url)
+        except _store.StoreError as exc:
+            if exc.status is None and not exc.refused:
+                raise
+            return _request(url, "HEAD", {"Origin": _PROBE_ORIGIN})
+        return ProbeResponse(status=200, headers={"content-length": str(size)})
 
     def preflight(self, url: str) -> ProbeResponse:
         return _request(
@@ -494,6 +523,38 @@ class _HeadCache:
         self._responses: dict[str, ProbeResponse] = {}
         self._known: dict[str, int] = dict(known or {})
         self.failed: dict[str, Exception] = {}  # host -> the first transport error
+        self._errors: dict[str, Exception] = {}  # url -> its prefetch's transport error
+
+    def prefetch(self, host: str, urls: list[str]) -> None:
+        """HEAD ``urls``, all on ``host``, in parallel, ahead of the checks that read them.
+
+        The first URL goes alone. When it fails, the host is dead and the rest
+        are not sent, as a sequential pass would not send them. A failure in
+        the parallel batch is kept per URL, and :meth:`head` turns it into the
+        host's failure when the checks reach that URL in order, so the
+        findings do not depend on which request finished first.
+        """
+        pending = [
+            u for u in dict.fromkeys(urls) if u not in self._responses and u not in self._known
+        ]
+        if not pending or self.head(pending[0]) is None:
+            return
+        rest = pending[1:]
+        if host in self.failed or not rest:
+            return
+        with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+            outcomes = list(pool.map(self._try_head, rest))
+        for url, outcome in zip(rest, outcomes, strict=True):
+            if isinstance(outcome, ProbeResponse):
+                self._responses[url] = outcome
+            else:
+                self._errors[url] = outcome
+
+    def _try_head(self, url: str) -> ProbeResponse | Exception:
+        try:
+            return self._prober.head(url)
+        except Exception as exc:  # noqa: BLE001 - kept for head() to report in order
+            return exc
 
     def head(self, url: str) -> ProbeResponse | None:
         response = self._responses.get(url)
@@ -502,13 +563,15 @@ class _HeadCache:
         host = urlparse(url).netloc.lower()
         if host in self.failed:
             return None
-        try:
-            response = self._prober.head(url)
-        except Exception as exc:  # noqa: BLE001 - a dead host is reported once
-            self.failed[host] = exc
-            return None
-        self._responses[url] = response
-        return response
+        error = self._errors.pop(url, None)
+        if error is None:
+            outcome = self._try_head(url)
+            if isinstance(outcome, ProbeResponse):
+                self._responses[url] = outcome
+                return outcome
+            error = outcome
+        self.failed[host] = error
+        return None
 
     def status(self, url: str) -> int | None:
         """The status the host answers for ``url``; None once the host failed."""
@@ -530,6 +593,7 @@ def _check_heads(host: str, targets: list[_Target], heads: _HeadCache) -> list[F
     one of them can be right, so the response is cached per URL and the check
     still runs per asset.
     """
+    heads.prefetch(host, [target.url for target in targets])
     findings: list[Finding] = []
     for target in targets:
         response = heads.head(target.url)
@@ -574,6 +638,7 @@ def _check_links(host: str, targets: list[_LinkTarget], heads: _HeadCache) -> li
     """
     if host in heads.failed:
         return []
+    heads.prefetch(host, [target.url for target in targets])
     findings: list[Finding] = []
     for target in targets:
         status = heads.status(target.url)
@@ -719,7 +784,7 @@ def validate_live(
     rather than failing the run.
     """
     if prober is None:
-        prober = _UrllibProber()
+        prober = _DefaultProber()
     base, named = _resolve_base(graph, base_url)
     by_host = _targets_by_host(graph, base)
     findings: list[Finding] = []

@@ -283,7 +283,8 @@ def validate(
     network is already in use. ``live=False`` turns it off either way.
     Disabling every ``PTL-LIV-00x`` rule via ``config`` skips the pass;
     disabling a subset just silences those findings. ``live_prober`` injects an
-    alternate prober, chiefly for offline testing.
+    alternate prober, chiefly for offline testing. Its ``head`` runs on several
+    threads at once (see :class:`rashid.live.Prober`).
     """
     if rules is None:
         from rashid.rules import DEFAULT_RULES

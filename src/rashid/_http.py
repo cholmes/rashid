@@ -1,12 +1,15 @@
 """What every outgoing HTTP request identifies itself as.
 
-Three passes reach the network over urllib — the live prober, the data pass's
-byte reader, and the schema pass fetching an unbundled profile schema — and
-all must send the same agent, so the string lives here rather than in any of
-them. None of them imports the others, and this module is stdlib-only, so it
-stays importable from all three without creating an edge between the passes.
+Four paths reach the network: the URL-mode crawl, the live prober, the data
+pass's byte reader, and the schema pass fetching an unbundled profile schema.
+All must send the same agent, so the string lives here rather than in any of
+them. Most requests go out through :mod:`rashid._store`, over obstore or, for
+what obstore cannot send, over urllib; the live prober's once-per-host probes
+go out over urllib. None of the passes imports the others, and this module is
+stdlib-only, so it stays importable from all of them without creating an edge
+between the passes.
 
-Raster reads go out through GDAL's own HTTP stack rather than urllib, so they
+Raster reads go out through GDAL's own HTTP stack rather than obstore, so they
 carry GDAL's agent, not this one. That agent defaults to ``GDAL/x.y.z``, which
 is named rather than anonymous, so those reads do not hit the 403 described
 below; the gap is one of consistency. Closing it means passing
@@ -26,7 +29,7 @@ _PROJECT_URL = "https://github.com/portolan-sdi/rashid"
 def user_agent() -> str:
     """The ``User-Agent`` every request this package sends must carry.
 
-    urllib defaults to ``Python-urllib/3.x``, which edge providers block:
+    urllib defaults to ``Python-urllib/3.x``, and edge providers block such agents:
     Cloudflare answers it with a 403 and a 17-byte error page, and a pass then
     reads that page back as the asset's bytes or its ``Content-Length``,
     failing rules against a healthy host. Naming the validator, its version,

@@ -28,17 +28,14 @@ fetched concurrently since the documents are small and many.
 
 from __future__ import annotations
 
-import json
 import posixpath
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
-from urllib.error import HTTPError
+from typing import Protocol
 from urllib.parse import quote, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from rashid._http import user_agent
+from rashid import _json, _store
 from rashid.catalog import ROOT_CATALOG
 
 #: Documents fetched before the crawl stops enqueuing. Past this a catalog is
@@ -46,10 +43,10 @@ from rashid.catalog import ROOT_CATALOG
 #: runner says the tree was cut short rather than pretending it was whole.
 DEFAULT_MAX_DOCUMENTS = 10_000
 
-#: Concurrent fetches per level of the tree.
-_WORKERS = 8
-
-_TIMEOUT = 30  # seconds per request
+#: Concurrent fetches per level of the tree. obstore releases the GIL during a
+#: request and reuses one connection pool per host, so the threads overlap the
+#: network waits rather than queue on them.
+_WORKERS = 32
 
 #: Largest document body the fetcher reads. A STAC document is kilobytes; a
 #: link that lands on something far larger is not a document, and reading it
@@ -86,43 +83,17 @@ class Fetcher(Protocol):
     def get(self, url: str) -> Fetched: ...
 
 
-class _HttpsOnlyRedirects(HTTPRedirectHandler):
-    """Follow a redirect only to another https URL.
-
-    urllib follows a 3xx anywhere by default, so a host could send the crawl
-    to ``http://`` or to a host the base never named and have the body land
-    in the tree. A redirect elsewhere is a fetch failure, and the runner
-    reports it as one.
-    """
-
-    def redirect_request(
-        self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
-    ) -> Request | None:
-        if urlparse(newurl).scheme.lower() != "https":
-            raise FetchError(f"redirect to a non-https URL refused: {newurl}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-class _UrllibFetcher:
-    def __init__(self) -> None:
-        self._opener = build_opener(_HttpsOnlyRedirects())
+class _StoreFetcher:
+    """The default fetcher: obstore, https only, redirects to https only."""
 
     def get(self, url: str) -> Fetched:
-        if urlparse(url).scheme.lower() != "https":
-            raise ValueError(f"refusing to fetch non-https URL: {url!r}")
-        request = Request(url, method="GET", headers={"User-Agent": user_agent()})
         try:
-            with self._opener.open(request, timeout=_TIMEOUT) as response:  # noqa: S310  # nosec B310
-                body = response.read(MAX_BODY_BYTES + 1)
-        except HTTPError as exc:
-            return Fetched(status=exc.code)
-        except FetchError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - urllib raises a zoo; the message is what matters
-            raise FetchError(f"GET {url}: {exc}") from exc
-        if len(body) > MAX_BODY_BYTES:
-            raise FetchError(f"GET {url}: body exceeds {MAX_BODY_BYTES} bytes")
-        return Fetched(status=response.status, body=body)
+            body = _store.get(url, max_bytes=MAX_BODY_BYTES)
+        except _store.StoreError as exc:
+            if exc.status is not None:
+                return Fetched(status=exc.status)
+            raise FetchError(str(exc)) from exc
+        return Fetched(status=200, body=body)
 
 
 def is_catalog_url(location: str) -> bool:
@@ -194,7 +165,7 @@ def crawl(
     left to the caller to judge.
     """
     if fetcher is None:
-        fetcher = _UrllibFetcher()
+        fetcher = _StoreFetcher()
     result = Crawl(base=base)
     root = ROOT_CATALOG.name
     seen = {root}
@@ -288,7 +259,7 @@ def _follow_paths(base: str, rel: str, body: bytes) -> list[str]:
     ``README.md``, so the ``PTL-FIL`` rules see what a directory walk would.
     """
     try:
-        data = json.loads(body)
+        data = _json.loads(body)
     except ValueError:
         return []
     if not isinstance(data, dict):

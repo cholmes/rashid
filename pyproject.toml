@@ -42,6 +42,8 @@ dependencies = [
     "rio-cogeo>=6",
     "pyproj>=3.7.1",
     "shapely>=2.1",
+    "orjson>=3.11",
+    "obstore>=0.9",
 ]
 
 [project.optional-dependencies]
@@ -75,6 +77,7 @@ dev = [
     "pip>=26.1",
     "pip-audit>=2.10",
     "mutmut>=3.6",
+    "trustme>=1.2.1",
 ]
 
 [tool.hatch.build.targets.wheel]

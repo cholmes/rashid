@@ -8,6 +8,7 @@ integration test in ``tests/integration/test_live_remote.py``.
 from __future__ import annotations
 
 import re
+import socket
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -15,7 +16,7 @@ from urllib.request import Request
 
 import pytest
 
-from rashid import RulesConfig, validate, validate_live
+from rashid import RulesConfig, _store, validate, validate_live
 from rashid import live as live_mod
 from rashid.catalog import CatalogGraph
 from rashid.live import (
@@ -28,9 +29,10 @@ from rashid.live import (
     LIV_SELF_BASE,
     LIV_UNAVAILABLE,
     ProbeResponse,
-    _UrllibProber,
+    _DefaultProber,
 )
 from rashid.model import Severity
+from tests._https import HttpsServer, Route
 from tests.conftest import VALID_MULTIHASH, CatalogBuilder, mutate_json
 
 pytestmark = pytest.mark.unit
@@ -754,16 +756,29 @@ def test_without_base_url_no_link_is_probed(catalog: CatalogBuilder) -> None:
     assert findings == []
 
 
-def test_link_probes_run_in_sorted_url_order(catalog: CatalogBuilder) -> None:
+def test_link_findings_follow_sorted_url_order(catalog: CatalogBuilder) -> None:
+    """The HEADs after a host's first one run in parallel, in any order.
+
+    Only the first request is sent alone, so it alone has a fixed place. The
+    findings must not depend on which request finished first: they follow
+    sorted URL order, and each URL is asked once.
+    """
     graph = _nested_tree(catalog)
-    prober = StatusProber()
-    validate_live(graph, prober, base_url=_BASE)
     asset_urls = {
         t.url for targets in live_mod._targets_by_host(graph, _BASE).values() for t in targets
     }
+    base, _named = live_mod._resolve_base(graph, _BASE)
+    link_urls = [t.url for t in live_mod._link_targets(graph, base)]
+    assert link_urls == sorted(link_urls) and len(link_urls) > 2
+    prober = StatusProber(dict.fromkeys(link_urls, 404))
+
+    findings = validate_live(graph, prober, base_url=_BASE)
+
     link_calls = [u for u in prober.head_calls if u not in asset_urls]
-    assert link_calls == sorted(link_calls)
-    assert len(link_calls) == len(set(link_calls))
+    assert link_calls[0] == link_urls[0]
+    assert sorted(link_calls) == link_urls
+    reported = [re.search(r"HEAD (\S+) returned", f.message)[1] for f in _link_findings(findings)]
+    assert reported == link_urls
 
 
 def test_link_target_shared_with_an_asset_is_headed_once(catalog: CatalogBuilder) -> None:
@@ -1077,7 +1092,8 @@ def test_runner_reports_self_base_and_it_can_be_disabled(catalog: CatalogBuilder
 #
 # The fake prober above never builds a Request, so a missing or malformed
 # User-Agent is invisible to every test that uses it. These drive the real
-# _UrllibProber against a recording urlopen instead (#64).
+# _DefaultProber against a recording urlopen instead (#64). Its HEAD goes to
+# obstore first, so _record makes obstore fail and the HEAD falls back.
 
 
 class _RecordedResponse:
@@ -1101,11 +1117,16 @@ def _recorder(requests: list[Request]) -> Any:
     return fake_urlopen
 
 
+def _store_fails(url: str) -> int:
+    raise _store.StoreError(f"HEAD {url} returned 404", 404)
+
+
 def _record(monkeypatch: pytest.MonkeyPatch, probe: str) -> Request:
     """Run one probe kind against a recording urlopen and return its Request."""
     requests: list[Request] = []
     monkeypatch.setattr(live_mod, "urlopen", _recorder(requests))
-    getattr(_UrllibProber(), probe)(_URL)
+    monkeypatch.setattr(live_mod._store, "head_size", _store_fails)
+    getattr(_DefaultProber(), probe)(_URL)
     (request,) = requests
     return request
 
@@ -1140,3 +1161,129 @@ def test_user_agent_does_not_displace_the_probe_headers(monkeypatch: pytest.Monk
     assert preflight.get_header("Access-control-request-headers") == (
         "Range, If-Match, If-Modified-Since, If-None-Match, If-Unmodified-Since"
     )
+
+
+# --- the default prober's HEAD: obstore first, urllib for what it drops -----
+
+
+def test_default_head_reads_the_size_through_obstore(https_server: HttpsServer) -> None:
+    https_server.routes["/x.parquet"] = Route(body=b"abcdef")
+
+    response = _DefaultProber().head(https_server.url("x.parquet"))
+
+    assert response == ProbeResponse(status=200, headers={"content-length": "6"})
+    (seen,) = https_server.seen
+    assert seen.method == "HEAD"
+    assert _AGENT_PATTERN.match(seen.headers["user-agent"])
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _store.StoreError("HEAD returned 404", 404),
+        _store.StoreError("HEAD returned no Content-Length", refused=True),
+        _store.StoreError("redirect to a non-https URL refused", refused=True),
+    ],
+    ids=["status", "no-content-length", "redirect-off-https"],
+)
+def test_default_head_falls_back_to_urllib(
+    monkeypatch: pytest.MonkeyPatch, failure: Exception
+) -> None:
+    """An answer obstore drops is asked again over urllib, which keeps the headers."""
+
+    def fail(url: str) -> int:
+        raise failure
+
+    requests: list[Request] = []
+    monkeypatch.setattr(live_mod._store, "head_size", fail)
+    monkeypatch.setattr(live_mod, "urlopen", _recorder(requests))
+
+    response = _DefaultProber().head(_URL)
+
+    assert response.status == 200
+    (request,) = requests
+    assert request.get_method() == "HEAD"
+
+
+def test_default_head_does_not_ask_a_dead_host_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transport failure has no answer to read again; urllib would only wait again."""
+    dead = _store.StoreError("HEAD https://data.example.org/x: error sending request")
+
+    def fail(url: str) -> int:
+        raise dead
+
+    requests: list[Request] = []
+    monkeypatch.setattr(live_mod._store, "head_size", fail)
+    monkeypatch.setattr(live_mod, "urlopen", _recorder(requests))
+
+    with pytest.raises(_store.StoreError) as raised:
+        _DefaultProber().head(_URL)
+    assert raised.value is dead
+    assert requests == []
+
+
+def test_default_head_reports_a_dead_host_once(catalog: CatalogBuilder) -> None:
+    """The real prober against a closed port: one PTL-LIV-000, no urllib retry."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    catalog.collection(
+        "roads",
+        assets={f"a{n}": _remote_asset(f"https://127.0.0.1:{port}/{n}.parquet") for n in range(3)},
+    )
+    graph = CatalogGraph.load(catalog.write())
+
+    class HeadsOnly(_DefaultProber):
+        def get_range(self, url: str) -> ProbeResponse:
+            return _good_head("1")
+
+        def preflight(self, url: str) -> ProbeResponse:
+            return _good_head("1")
+
+    findings = validate_live(graph, HeadsOnly())
+
+    unavailable = [f for f in findings if f.rule_id == LIV_UNAVAILABLE]
+    assert len(unavailable) == 1
+    assert "error sending request" in unavailable[0].message
+
+
+def test_parallel_heads_report_a_failure_in_order(catalog: CatalogBuilder) -> None:
+    """A failure mid-batch is the host's failure only when the checks reach it."""
+    catalog.collection(
+        "roads",
+        assets={f"a{n}": _remote_asset(f"https://data.example.org/{n}.parquet") for n in range(6)},
+    )
+    graph = CatalogGraph.load(catalog.write())
+    broken = "https://data.example.org/3.parquet"
+
+    class BrokenProber(FakeProber):
+        def head(self, url: str) -> ProbeResponse:
+            self.head_calls.append(url)
+            if url == broken:
+                raise OSError("reset by peer")
+            return _good_head("999")  # every earlier asset mismatches file:size
+
+    findings = validate_live(graph, BrokenProber())
+
+    assert _ids(findings) == [LIV_HEAD_LENGTH] * 3 + [LIV_UNAVAILABLE]
+    assert [f.json_pointer for f in findings[:3]] == ["/assets/a0", "/assets/a1", "/assets/a2"]
+    assert "reset by peer" in findings[3].message
+
+
+def test_the_first_head_on_a_host_goes_alone(catalog: CatalogBuilder) -> None:
+    catalog.collection(
+        "roads",
+        assets={f"a{n}": _remote_asset(f"https://data.example.org/{n}.parquet") for n in range(6)},
+    )
+    graph = CatalogGraph.load(catalog.write())
+
+    class DeadProber(FakeProber):
+        def head(self, url: str) -> ProbeResponse:
+            self.head_calls.append(url)
+            raise OSError("connection refused")
+
+    prober = DeadProber()
+    findings = validate_live(graph, prober)
+
+    assert prober.head_calls == ["https://data.example.org/0.parquet"]
+    assert _ids(findings) == [LIV_UNAVAILABLE]

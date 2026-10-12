@@ -63,7 +63,6 @@ from __future__ import annotations
 
 import glob as globmodule
 import hashlib
-import json
 import math
 import posixpath
 import re
@@ -86,6 +85,7 @@ from shapely.errors import ShapelyError
 from shapely.geometry import shape
 from shapely.geometry.base import BaseGeometry
 
+from rashid import _json
 from rashid._multihash import decode_multihash
 from rashid.catalog import CatalogGraph, Node
 from rashid.data import (
@@ -435,8 +435,8 @@ def _read_head(stream: Iterator[bytes]) -> bytes:
 def _close(stream: Iterator[bytes]) -> None:
     """Release a stream this check is done with, rather than leave it to the collector.
 
-    ``_http_stream`` is a generator holding an open ``urlopen`` response, so a
-    stream dropped part-way keeps a socket until it is reclaimed.
+    ``_http_stream`` is a generator holding an open obstore response, so a
+    stream dropped part-way keeps a connection until it is reclaimed.
     ``AssetReader.stream`` promises only an ``Iterator[bytes]``, which need not
     be closeable, hence the guard.
     """
@@ -908,7 +908,7 @@ def _geo_metadata(parquet: Any) -> dict[str, Any] | None:
     if raw is None:
         return None
     try:
-        geo = json.loads(raw)
+        geo = _json.loads(raw)
     except (ValueError, TypeError):
         return None
     return geo if isinstance(geo, dict) else None
@@ -1980,7 +1980,7 @@ def _geo_from_parquet(located: Locator) -> _Geo | None:
     raw = (parquet.schema_arrow.metadata or {}).get(b"geo")
     if raw is None:
         return None
-    geo = json.loads(raw)
+    geo = _json.loads(raw)
     primary = geo.get("primary_column")
     column = geo.get("columns", {}).get(primary, {})
     bbox = column.get("bbox")

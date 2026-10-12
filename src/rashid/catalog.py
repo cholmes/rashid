@@ -7,7 +7,6 @@ observes exactly what is on disk.
 
 from __future__ import annotations
 
-import json
 import os
 import posixpath
 from collections.abc import Iterator
@@ -15,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 from urllib.parse import urlparse
+
+from rashid import _json
 
 Kind = Literal["catalog", "collection", "item", "unknown"]
 
@@ -226,7 +227,7 @@ class CatalogGraph:
                 )
                 structural = filename in ("catalog.json", "collection.json")
                 try:
-                    data = json.loads(abs_path.read_text(encoding="utf-8"))
+                    data = _json.loads(abs_path.read_text(encoding="utf-8"))
                 except (ValueError, UnicodeDecodeError) as exc:
                     if structural:
                         graph.nodes[rel] = Node(
