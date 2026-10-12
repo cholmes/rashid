@@ -377,6 +377,24 @@ def test_unparseable_document_is_written_and_not_followed(
     assert result.documents == 2  # root and the broken file; nothing below it
 
 
+def test_crawl_follows_a_document_with_a_byte_order_mark(
+    catalog: CatalogBuilder, tmp_path: Path
+) -> None:
+    """The crawl parses bytes as ``json.loads`` does, as rashid 0.3.0 did.
+
+    The graph load still reports the BOM; the crawl must not hide the
+    documents below it.
+    """
+    root = _nested(catalog)
+    sector = root / "sector-1" / "catalog.json"
+    sector.write_bytes(b"\xef\xbb\xbf" + sector.read_bytes())
+    dest = tmp_path / "dest"
+
+    crawl(_BASE, dest, DirFetcher(root))
+
+    assert "sector-1/roads/collection.json" in _rel_files(dest)
+
+
 def test_crawl_caps_the_document_count(catalog: CatalogBuilder, tmp_path: Path) -> None:
     for i in range(6):
         catalog.collection(f"c{i}")

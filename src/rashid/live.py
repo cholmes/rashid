@@ -154,7 +154,12 @@ class ProbeResponse:
 
 
 class Prober(Protocol):
-    """Issues the three probe requests against one URL."""
+    """Issues the three probe requests against one URL.
+
+    :meth:`head` runs on up to ``_WORKERS`` threads at once, one URL each, so
+    an implementation must be safe to call concurrently. :meth:`get_range`
+    and :meth:`preflight` run on the calling thread only.
+    """
 
     def get_range(self, url: str) -> ProbeResponse:
         """GET with ``Range: bytes=0-0`` and an ``Origin`` header."""
@@ -216,9 +221,13 @@ class _DefaultProber:
     headers that obstore does not return, so they go out over urllib. The HEADs
     run once per asset and per link, so they go out over obstore, which reuses
     one connection pool per host. obstore answers a HEAD with the size alone.
-    When it fails for any reason, a status or a missing ``Content-Length`` or a
-    redirect off https, the HEAD is sent again over urllib, so the checks read
-    the full response exactly as before.
+
+    When the host answers but obstore does not return the answer, the HEAD is
+    sent again over urllib, so the checks read the full response exactly as
+    before. That covers a non-2xx status, whose headers ``_check_head`` still
+    reads, a missing ``Content-Length``, and a redirect off https. A transport
+    failure is not sent again: it marks the host dead, and asking twice only
+    doubles the wait.
     """
 
     def get_range(self, url: str) -> ProbeResponse:
@@ -227,7 +236,9 @@ class _DefaultProber:
     def head(self, url: str) -> ProbeResponse:
         try:
             size = _store.head_size(url)
-        except (OSError, ValueError):
+        except _store.StoreError as exc:
+            if exc.status is None and not exc.refused:
+                raise
             return _request(url, "HEAD", {"Origin": _PROBE_ORIGIN})
         return ProbeResponse(status=200, headers={"content-length": str(size)})
 

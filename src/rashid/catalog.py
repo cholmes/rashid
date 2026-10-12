@@ -227,7 +227,7 @@ class CatalogGraph:
                 )
                 structural = filename in ("catalog.json", "collection.json")
                 try:
-                    data = _json.loads(abs_path.read_bytes())
+                    data = _json.loads(abs_path.read_text(encoding="utf-8"))
                 except (ValueError, UnicodeDecodeError) as exc:
                     if structural:
                         graph.nodes[rel] = Node(

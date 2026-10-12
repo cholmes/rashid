@@ -8,6 +8,7 @@ integration test in ``tests/integration/test_live_remote.py``.
 from __future__ import annotations
 
 import re
+import socket
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -1149,7 +1150,7 @@ def test_user_agent_does_not_displace_the_probe_headers(monkeypatch: pytest.Monk
     )
 
 
-# --- the default prober's HEAD: obstore first, urllib on any failure --------
+# --- the default prober's HEAD: obstore first, urllib for what it drops -----
 
 
 def test_default_head_reads_the_size_through_obstore(https_server: HttpsServer) -> None:
@@ -1167,15 +1168,15 @@ def test_default_head_reads_the_size_through_obstore(https_server: HttpsServer) 
     "failure",
     [
         _store.StoreError("HEAD returned 404", 404),
-        _store.StoreError("Content-Length Header missing from response"),
-        ValueError("refusing to fetch non-https URL"),
+        _store.StoreError("HEAD returned no Content-Length", refused=True),
+        _store.StoreError("redirect to a non-https URL refused", refused=True),
     ],
-    ids=["status", "no-content-length", "not-requestable"],
+    ids=["status", "no-content-length", "redirect-off-https"],
 )
 def test_default_head_falls_back_to_urllib(
     monkeypatch: pytest.MonkeyPatch, failure: Exception
 ) -> None:
-    """Every obstore failure is asked again over urllib, which keeps the headers."""
+    """An answer obstore drops is asked again over urllib, which keeps the headers."""
 
     def fail(url: str) -> int:
         raise failure
@@ -1189,6 +1190,48 @@ def test_default_head_falls_back_to_urllib(
     assert response.status == 200
     (request,) = requests
     assert request.get_method() == "HEAD"
+
+
+def test_default_head_does_not_ask_a_dead_host_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transport failure has no answer to read again; urllib would only wait again."""
+    dead = _store.StoreError("HEAD https://data.example.org/x: error sending request")
+
+    def fail(url: str) -> int:
+        raise dead
+
+    requests: list[Request] = []
+    monkeypatch.setattr(live_mod._store, "head_size", fail)
+    monkeypatch.setattr(live_mod, "urlopen", _recorder(requests))
+
+    with pytest.raises(_store.StoreError) as raised:
+        _DefaultProber().head(_URL)
+    assert raised.value is dead
+    assert requests == []
+
+
+def test_default_head_reports_a_dead_host_once(catalog: CatalogBuilder) -> None:
+    """The real prober against a closed port: one PTL-LIV-000, no urllib retry."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    catalog.collection(
+        "roads",
+        assets={f"a{n}": _remote_asset(f"https://127.0.0.1:{port}/{n}.parquet") for n in range(3)},
+    )
+    graph = CatalogGraph.load(catalog.write())
+
+    class HeadsOnly(_DefaultProber):
+        def get_range(self, url: str) -> ProbeResponse:
+            return _good_head("1")
+
+        def preflight(self, url: str) -> ProbeResponse:
+            return _good_head("1")
+
+    findings = validate_live(graph, HeadsOnly())
+
+    unavailable = [f for f in findings if f.rule_id == LIV_UNAVAILABLE]
+    assert len(unavailable) == 1
+    assert "error sending request" in unavailable[0].message
 
 
 def test_parallel_heads_report_a_failure_in_order(catalog: CatalogBuilder) -> None:

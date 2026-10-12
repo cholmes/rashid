@@ -1,4 +1,4 @@
-"""Read https objects through obstore.
+"""Read https objects through obstore, and through urllib where obstore cannot.
 
 The crawl, the data reader, the schema fetch, and the live pass's per-asset
 HEADs all read objects by URL. obstore sends those requests from Rust. It keeps
@@ -11,48 +11,86 @@ exception's text. :class:`StoreError` carries the status that text names, so a
 caller can tell a 404 from a dead host. Every failure is an :class:`OSError`,
 which is what the data pass treats as an unread asset.
 
-obstore builds the request URL from an object path. It encodes ``%`` and
-``?`` itself, so :func:`_locate` decodes the URL's path first and refuses a URL
-with a query string, which no object path can carry. obstore also refuses a
-response with no ``Content-Length`` and a redirect to a non-https URL. Both
-become a :class:`StoreError` with no status.
+obstore cannot send every request a catalog can name, nor read every answer a
+server can give:
+
+- It builds the request URL from an object path, so a URL with a query string,
+  an encoded ``/`` (``%2F``), or an empty, ``.`` or ``..`` segment has no
+  object path that requests the same URL.
+- It refuses a response with no ``Content-Length``, which a chunked HTTP/1.1
+  answer or an HTTP/2 answer may omit.
+
+Those requests go out over urllib instead, with the same agent, the same
+https-only redirect policy, and the same errors, so the transport is invisible
+to callers. A :class:`StoreError` with ``refused`` set means the server
+answered but the answer was not one rashid accepts: a redirect off https, or a
+HEAD with no ``Content-Length``.
+
+Timeouts: ``read_timeout`` bounds each wait for bytes, as urllib's socket
+timeout does, so a stalled server fails in 30 s while a large asset that keeps
+arriving downloads in full. obstore also requires an overall ``timeout``; it is
+set far past any download a check makes, so only a server that trickles bytes
+forever reaches it.
 """
 
 from __future__ import annotations
 
 import re
+import ssl
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import timedelta
 from functools import cache
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError
+from urllib.parse import unquote, urlsplit
+from urllib.request import (
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    OpenerDirector,
+    Request,
+    build_opener,
+)
 
 import obstore
-from obstore.exceptions import NotSupportedError
+from obstore.exceptions import InvalidPathError, NotSupportedError
 from obstore.store import HTTPStore
 
 from rashid._http import user_agent
 
-_TIMEOUT = timedelta(seconds=30)
+# Longest wait for the next bytes of a response, in either transport.
+_IDLE = timedelta(seconds=30)
 
 # obstore's errors name the status as "status code: 404 Not Found".
 _STATUS = re.compile(r"status code: (\d{3})\b")
 
-#: Client options for every store. Tests add ``allow_invalid_certificates``
-#: here to reach a local server with a self-signed certificate.
-CLIENT_OPTIONS: dict[str, Any] = {"timeout": _TIMEOUT}
+# obstore's text for the answers it refuses that urllib can still read.
+_REFUSED = ("MissingContentLength", "error following redirect")
 
-# Retry a 5xx or a dropped connection up to 3 times, within the request
-# timeout. A host that throttles a parallel crawl answers 503 now and then.
-_RETRY: dict[str, Any] = {"max_retries": 3, "retry_timeout": _TIMEOUT}
+_ENCODED_SLASH = re.compile(r"%2f", re.IGNORECASE)
+
+#: Client options for every store. Tests add ``allow_invalid_certificates``
+#: here to reach a local server with a self-signed certificate; the urllib
+#: transport reads the same key.
+CLIENT_OPTIONS: dict[str, Any] = {"read_timeout": _IDLE, "timeout": timedelta(hours=24)}
+
+# Retry a 5xx or a dropped connection up to 3 times, for up to 30 s after the
+# first attempt. A host that throttles a parallel crawl answers 503 now and then.
+_RETRY: dict[str, Any] = {"max_retries": 3, "retry_timeout": _IDLE}
 
 
 class StoreError(OSError):
-    """A request that failed. ``status`` is the HTTP status, when one came back."""
+    """A request that failed.
 
-    def __init__(self, message: str, status: int | None = None) -> None:
+    ``status`` is the HTTP status, when one came back. ``refused`` is set when
+    the server answered but rashid did not accept the answer: a redirect off
+    https, or a HEAD with no ``Content-Length``.
+    """
+
+    def __init__(self, message: str, status: int | None = None, *, refused: bool = False) -> None:
         super().__init__(message)
         self.status = status
+        self.refused = refused
 
 
 @cache
@@ -63,20 +101,25 @@ def _store(origin: str) -> HTTPStore:
 
 
 def reset() -> None:
-    """Drop every cached store, so the next request reads ``CLIENT_OPTIONS`` again."""
+    """Drop every cached client, so the next request reads ``CLIENT_OPTIONS`` again."""
     _store.cache_clear()
+    _opener.cache_clear()
 
 
-def _locate(url: str) -> tuple[HTTPStore, str]:
-    """The store for ``url``'s host and the object path obstore requests."""
-    parsed = urlparse(url)
+def _locate(url: str) -> tuple[HTTPStore, str] | None:
+    """The store for ``url``'s host and its object path; None if obstore cannot request it.
+
+    ``urlsplit``, not ``urlparse``: the latter moves a ``;…`` suffix of the last
+    segment out of the path, and the object requested would lose it.
+    """
+    parsed = urlsplit(url)
     if parsed.scheme.lower() != "https" or not parsed.netloc:
         raise ValueError(f"refusing to fetch non-https URL: {url!r}")
-    if parsed.query:
-        raise StoreError(f"cannot request a URL with a query string: {url}")
+    if parsed.query or _ENCODED_SLASH.search(parsed.path):
+        return None
     path = unquote(parsed.path).lstrip("/")
-    if not path or any(part == "" for part in path.split("/")):
-        raise StoreError(f"URL does not name an object: {url}")
+    if not path or any(part in ("", ".", "..") for part in path.split("/")):
+        return None
     return _store(f"https://{parsed.netloc.lower()}"), path
 
 
@@ -89,30 +132,94 @@ def _error(method: str, url: str, exc: Exception) -> StoreError:
     if isinstance(exc, FileNotFoundError):
         return StoreError(f"{method} {url} returned 404", 404)
     reason = text.splitlines()[0] if text else type(exc).__name__
-    return StoreError(f"{method} {url}: {reason}")
+    refused = isinstance(exc, InvalidPathError) or any(marker in text for marker in _REFUSED)
+    return StoreError(f"{method} {url}: {reason}", refused=refused)
+
+
+# --- the urllib transport ----------------------------------------------------
+
+
+class _HttpsOnlyRedirects(HTTPRedirectHandler):
+    """Follow a redirect only to another https URL, as obstore does."""
+
+    def redirect_request(
+        self, req: Request, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Request | None:
+        if urlsplit(newurl).scheme.lower() != "https":
+            raise StoreError(f"redirect to a non-https URL refused: {newurl}", refused=True)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+@cache
+def _opener() -> OpenerDirector:
+    context = ssl.create_default_context()
+    if CLIENT_OPTIONS.get("allow_invalid_certificates"):
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return build_opener(_HttpsOnlyRedirects(), HTTPSHandler(context=context))
+
+
+@contextmanager
+def _urlopen(url: str, method: str, headers: dict[str, str] | None = None) -> Iterator[Any]:
+    """An open urllib response; every failure, including a read's, is a :class:`StoreError`."""
+    request = Request(url, method=method, headers={"User-Agent": user_agent(), **(headers or {})})
+    try:
+        idle = CLIENT_OPTIONS["read_timeout"].total_seconds()
+        with _opener().open(request, timeout=idle) as response:
+            yield response
+    except HTTPError as exc:
+        raise StoreError(f"{method} {url} returned {exc.code}", exc.code) from exc
+    except StoreError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - urllib raises many types; the message is what matters
+        raise StoreError(f"{method} {url}: {exc}") from exc
+
+
+def _urllib_get(url: str, max_bytes: int | None) -> bytes:
+    with _urlopen(url, "GET") as response:
+        body: bytes = response.read() if max_bytes is None else response.read(max_bytes + 1)
+    if max_bytes is not None and len(body) > max_bytes:
+        raise StoreError(f"GET {url}: body exceeds {max_bytes} bytes")
+    return body
+
+
+# --- reads -------------------------------------------------------------------
 
 
 def get(url: str, *, max_bytes: int | None = None) -> bytes:
     """The whole body of ``url``. Raises :class:`StoreError` past ``max_bytes``."""
-    store, path = _locate(url)
+    located = _locate(url)
+    if located is None:
+        return _urllib_get(url, max_bytes)
     try:
-        result = obstore.get(store, path)
+        result = obstore.get(*located)
         if max_bytes is not None and result.meta["size"] > max_bytes:
             raise StoreError(f"GET {url}: body exceeds {max_bytes} bytes")
         return result.bytes().to_bytes()
     except StoreError:
         raise
     except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-        raise _error("GET", url, exc) from exc
+        error = _error("GET", url, exc)
+        if not error.refused:
+            raise error from exc
+    return _urllib_get(url, max_bytes)
 
 
 def head_size(url: str) -> int:
     """The ``Content-Length`` a HEAD of ``url`` answers."""
-    store, path = _locate(url)
-    try:
-        return int(obstore.head(store, path)["size"])
-    except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-        raise _error("HEAD", url, exc) from exc
+    located = _locate(url)
+    if located is not None:
+        try:
+            return int(obstore.head(*located)["size"])
+        except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
+            error = _error("HEAD", url, exc)
+            if not error.refused:
+                raise error from exc
+    with _urlopen(url, "HEAD") as response:
+        length = response.headers.get("Content-Length")
+    if length is None or not length.isdigit():
+        raise StoreError(f"HEAD {url} returned no Content-Length", refused=True)
+    return int(length)
 
 
 def get_range(url: str, start: int, end: int) -> bytes:
@@ -122,21 +229,39 @@ def get_range(url: str, start: int, end: int) -> bytes:
     obstore refuses that answer. The object is then read whole and sliced, as
     a client without range support has to.
     """
-    store, path = _locate(url)
-    try:
-        return obstore.get_range(store, path, start=start, end=end).to_bytes()
-    except NotSupportedError:
-        return get(url)[start:end]
-    except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-        raise _error("GET", url, exc) from exc
+    located = _locate(url)
+    if located is not None:
+        try:
+            return obstore.get_range(*located, start=start, end=end).to_bytes()
+        except NotSupportedError:
+            return get(url)[start:end]
+        except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
+            error = _error("GET", url, exc)
+            if not error.refused:
+                raise error from exc
+    with _urlopen(url, "GET", {"Range": f"bytes={start}-{end - 1}"}) as response:
+        data: bytes = response.read()
+        status = response.status
+    return data[start:end] if status == 200 else data
 
 
 def stream(url: str, chunk_size: int) -> Iterator[bytes]:
     """The body of ``url`` in chunks. No request leaves until iteration starts."""
-    store, path = _locate(url)
-    try:
-        result = obstore.get(store, path)
-        for chunk in result.stream(min_chunk_size=chunk_size):
-            yield bytes(chunk)
-    except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-        raise _error("GET", url, exc) from exc
+    located = _locate(url)
+    if located is not None:
+        try:
+            result = obstore.get(*located)
+        except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
+            error = _error("GET", url, exc)
+            if not error.refused:
+                raise error from exc
+        else:
+            try:
+                for chunk in result.stream(min_chunk_size=chunk_size):
+                    yield bytes(chunk)
+            except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
+                raise _error("GET", url, exc) from exc
+            return
+    with _urlopen(url, "GET") as response:
+        while chunk := response.read(chunk_size):
+            yield chunk
