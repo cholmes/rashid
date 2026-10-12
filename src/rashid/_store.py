@@ -21,10 +21,16 @@ server can give:
   answer or an HTTP/2 answer may omit.
 
 Those requests go out over urllib instead, with the same agent, the same
-https-only redirect policy, and the same errors, so the transport is invisible
-to callers. A :class:`StoreError` with ``refused`` set means the server
-answered but the answer was not one rashid accepts: a redirect off https, or a
-HEAD with no ``Content-Length``.
+https-only redirect policy, the same retries of a 5xx or a failed connection,
+and the same errors, so the transport is invisible to callers. One difference
+stays: obstore also retries a body that breaks off part-way, and urllib does
+not.
+
+A :class:`StoreError` with ``refused`` set means the server answered but the
+answer was not one rashid accepts: a redirect off https, or a HEAD with no
+``Content-Length``. urllib cannot do better with either, so neither is sent
+again here; the live prober, which reads such an answer anyway, sends it again
+itself.
 
 Timeouts: ``read_timeout`` bounds each wait for bytes, as urllib's socket
 timeout does, so a stalled server fails in 30 s while a large asset that keeps
@@ -37,6 +43,7 @@ from __future__ import annotations
 
 import re
 import ssl
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import timedelta
@@ -64,8 +71,10 @@ _IDLE = timedelta(seconds=30)
 # obstore's errors name the status as "status code: 404 Not Found".
 _STATUS = re.compile(r"status code: (\d{3})\b")
 
-# obstore's text for the answers it refuses that urllib can still read.
-_REFUSED = ("MissingContentLength", "error following redirect")
+# obstore's text for a response with no Content-Length, and for a redirect
+# it would not follow.
+_NO_LENGTH = "MissingContentLength"
+_REDIRECT = "error following redirect"
 
 _ENCODED_SLASH = re.compile(r"%2f", re.IGNORECASE)
 
@@ -76,7 +85,11 @@ CLIENT_OPTIONS: dict[str, Any] = {"read_timeout": _IDLE, "timeout": timedelta(ho
 
 # Retry a 5xx or a dropped connection up to 3 times, for up to 30 s after the
 # first attempt. A host that throttles a parallel crawl answers 503 now and then.
+# The urllib transport reads the same values.
 _RETRY: dict[str, Any] = {"max_retries": 3, "retry_timeout": _IDLE}
+
+# The urllib transport's first wait before a retry; each retry doubles it.
+_BACKOFF = 0.1  # seconds
 
 
 class StoreError(OSError):
@@ -132,8 +145,18 @@ def _error(method: str, url: str, exc: Exception) -> StoreError:
     if isinstance(exc, FileNotFoundError):
         return StoreError(f"{method} {url} returned 404", 404)
     reason = text.splitlines()[0] if text else type(exc).__name__
-    refused = isinstance(exc, InvalidPathError) or any(marker in text for marker in _REFUSED)
+    refused = _NO_LENGTH in text or _REDIRECT in text
     return StoreError(f"{method} {url}: {reason}", refused=refused)
+
+
+def _urllib_can_read(exc: Exception) -> bool:
+    """Whether urllib can send the request or read the answer obstore did not.
+
+    obstore cannot parse some paths, and it refuses a body with no
+    ``Content-Length``; urllib handles both. A redirect off https is refused by
+    both transports, so asking urllib only repeats the request.
+    """
+    return isinstance(exc, InvalidPathError) or _NO_LENGTH in str(exc)
 
 
 # --- the urllib transport ----------------------------------------------------
@@ -159,16 +182,39 @@ def _opener() -> OpenerDirector:
     return build_opener(_HttpsOnlyRedirects(), HTTPSHandler(context=context))
 
 
+def _send(url: str, method: str, headers: dict[str, str] | None) -> Any:
+    """Open ``url`` over urllib, retrying a 5xx or a failed connection as obstore does."""
+    request = Request(url, method=method, headers={"User-Agent": user_agent(), **(headers or {})})
+    idle = CLIENT_OPTIONS["read_timeout"].total_seconds()
+    deadline = time.monotonic() + _RETRY["retry_timeout"].total_seconds()
+    attempt = 0
+    cause: Exception
+    while True:
+        try:
+            return _opener().open(request, timeout=idle)
+        except HTTPError as exc:
+            exc.close()
+            error = StoreError(f"{method} {url} returned {exc.code}", exc.code)
+            retry, cause = exc.code >= 500, exc
+        except StoreError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - urllib raises many types; the message is what matters
+            error = StoreError(f"{method} {url}: {exc}")
+            retry, cause = True, exc
+        delay = _BACKOFF * 2**attempt
+        if not retry or attempt >= _RETRY["max_retries"] or time.monotonic() + delay > deadline:
+            raise error from cause
+        time.sleep(delay)
+        attempt += 1
+
+
 @contextmanager
 def _urlopen(url: str, method: str, headers: dict[str, str] | None = None) -> Iterator[Any]:
     """An open urllib response; every failure, including a read's, is a :class:`StoreError`."""
-    request = Request(url, method=method, headers={"User-Agent": user_agent(), **(headers or {})})
+    response = _send(url, method, headers)
     try:
-        idle = CLIENT_OPTIONS["read_timeout"].total_seconds()
-        with _opener().open(request, timeout=idle) as response:
+        with response:
             yield response
-    except HTTPError as exc:
-        raise StoreError(f"{method} {url} returned {exc.code}", exc.code) from exc
     except StoreError:
         raise
     except Exception as exc:  # noqa: BLE001 - urllib raises many types; the message is what matters
@@ -199,22 +245,24 @@ def get(url: str, *, max_bytes: int | None = None) -> bytes:
     except StoreError:
         raise
     except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-        error = _error("GET", url, exc)
-        if not error.refused:
-            raise error from exc
+        if not _urllib_can_read(exc):
+            raise _error("GET", url, exc) from exc
     return _urllib_get(url, max_bytes)
 
 
 def head_size(url: str) -> int:
-    """The ``Content-Length`` a HEAD of ``url`` answers."""
+    """The ``Content-Length`` a HEAD of ``url`` answers.
+
+    A HEAD with no ``Content-Length`` has no size for urllib to read either,
+    so only a path obstore cannot parse goes out over urllib.
+    """
     located = _locate(url)
     if located is not None:
         try:
             return int(obstore.head(*located)["size"])
         except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-            error = _error("HEAD", url, exc)
-            if not error.refused:
-                raise error from exc
+            if not isinstance(exc, InvalidPathError):
+                raise _error("HEAD", url, exc) from exc
     with _urlopen(url, "HEAD") as response:
         length = response.headers.get("Content-Length")
     if length is None or not length.isdigit():
@@ -236,9 +284,8 @@ def get_range(url: str, start: int, end: int) -> bytes:
         except NotSupportedError:
             return get(url)[start:end]
         except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-            error = _error("GET", url, exc)
-            if not error.refused:
-                raise error from exc
+            if not _urllib_can_read(exc):
+                raise _error("GET", url, exc) from exc
     with _urlopen(url, "GET", {"Range": f"bytes={start}-{end - 1}"}) as response:
         data: bytes = response.read()
         status = response.status
@@ -252,9 +299,8 @@ def stream(url: str, chunk_size: int) -> Iterator[bytes]:
         try:
             result = obstore.get(*located)
         except Exception as exc:  # noqa: BLE001 - obstore raises several types; the text has the status
-            error = _error("GET", url, exc)
-            if not error.refused:
-                raise error from exc
+            if not _urllib_can_read(exc):
+                raise _error("GET", url, exc) from exc
         else:
             try:
                 for chunk in result.stream(min_chunk_size=chunk_size):

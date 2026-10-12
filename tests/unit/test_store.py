@@ -5,6 +5,7 @@ from __future__ import annotations
 import socket
 from datetime import timedelta
 from importlib.metadata import version
+from typing import Any
 
 import pytest
 
@@ -73,6 +74,7 @@ def test_get_refuses_a_redirect_to_http(https_server: HttpsServer) -> None:
     assert raised.value.status is None
     assert raised.value.refused
     assert "redirect" in str(raised.value)
+    assert len(https_server.seen) == 1  # urllib would refuse it too; not asked again
 
 
 def test_a_body_without_content_length_is_read_over_urllib(https_server: HttpsServer) -> None:
@@ -99,6 +101,7 @@ def test_a_head_without_content_length_is_refused(https_server: HttpsServer) -> 
         _store.head_size(https_server.url("x.bin"))
     assert raised.value.refused
     assert raised.value.status is None
+    assert len(https_server.seen) == 1  # urllib has no size to read either
 
 
 def test_the_path_is_encoded_once(https_server: HttpsServer) -> None:
@@ -298,3 +301,51 @@ def test_get_range_reports_the_status(https_server: HttpsServer) -> None:
     with pytest.raises(_store.StoreError) as raised:
         _store.get_range(https_server.url("missing.bin"), 0, 4)
     assert raised.value.status == 404
+
+
+@pytest.mark.parametrize("path", ["/x.json", "/x.json?v=1"], ids=["obstore", "urllib"])
+def test_both_transports_retry_a_5xx(https_server: HttpsServer, path: str) -> None:
+    https_server.routes[path] = Route(body=b"{}", fail_first=2)
+
+    assert _store.get(https_server.base + path) == b"{}"
+    assert len(https_server.seen) == 3
+
+
+@pytest.mark.parametrize("path", ["/x.json", "/x.json?v=1"], ids=["obstore", "urllib"])
+def test_both_transports_give_up_after_the_retries(
+    https_server: HttpsServer, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    monkeypatch.setitem(_store._RETRY, "max_retries", 2)
+    _store.reset()
+    https_server.routes[path] = Route(body=b"{}", fail_first=10)
+
+    with pytest.raises(_store.StoreError) as raised:
+        _store.get(https_server.base + path)
+    assert raised.value.status == 503
+    assert len(https_server.seen) == 3
+
+
+def test_urllib_does_not_retry_a_4xx(https_server: HttpsServer) -> None:
+    with pytest.raises(_store.StoreError):
+        _store.get(https_server.url("missing.json?v=1"))
+    assert len(https_server.seen) == 1
+
+
+def test_urllib_retries_a_failed_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    calls: list[str] = []
+    real = _store._opener
+
+    class Counting:
+        def open(self, request: Any, timeout: float) -> Any:
+            calls.append(request.full_url)
+            return real().open(request, timeout=timeout)
+
+    monkeypatch.setattr(_store, "_opener", lambda: Counting())
+
+    with pytest.raises(_store.StoreError) as raised:
+        _store.get(f"https://127.0.0.1:{port}/x.json?v=1")
+    assert raised.value.status is None
+    assert len(calls) == 1 + _store._RETRY["max_retries"]

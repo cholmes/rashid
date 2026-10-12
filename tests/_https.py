@@ -26,7 +26,8 @@ class Route:
     """One canned answer. ``length=False`` sends no ``Content-Length``.
 
     ``delay`` is a pause, in seconds, before each byte of the body after the
-    first, so a test can serve a slow body or one that stalls.
+    first, so a test can serve a slow body or one that stalls. The first
+    ``fail_first`` requests answer 503 instead, as a throttling host does.
     """
 
     status: int = 200
@@ -35,6 +36,7 @@ class Route:
     honor_range: bool = True
     length: bool = True
     delay: float = 0.0
+    fail_first: int = 0
 
 
 @dataclass
@@ -67,6 +69,9 @@ def _handler(server: HttpsServer) -> type[BaseHTTPRequestHandler]:
             )
             route = server.routes.get(self.path, Route(status=404))
             body, status = route.body, route.status
+            if route.fail_first:
+                route.fail_first -= 1
+                body, status = b"", 503
             headers = dict(route.headers)
             byte_range = self.headers.get("Range")
             if byte_range and route.honor_range and status == 200:
