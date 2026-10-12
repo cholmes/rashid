@@ -20,6 +20,7 @@ from collections.abc import Callable
 from typing import Any
 
 from rashid._jsonschema import SchemaError, stac_registry
+from rashid._parallel import precomputed
 from rashid.catalog import CatalogGraph, Kind
 from rashid.model import Finding, Severity
 
@@ -56,13 +57,23 @@ def default_validator() -> Validator:
     """
     from jsonschema import Draft7Validator
 
-    from rashid._jsonschema import _STAC_BASE, STAC_VERSION, describe
+    from rashid._jsonschema import (
+        _STAC_BASE,
+        STAC_VERSION,
+        compile_rust,
+        screened,
+        stac_rust_registry,
+    )
 
     registry = stac_registry()
-    validators = {
-        stac_type: Draft7Validator({"$ref": f"{_STAC_BASE}{path}"}, registry=registry)
-        for stac_type, path in _ROOT_SCHEMAS.items()
-    }
+    rust_registry = stac_rust_registry()
+    validators: dict[str, Validator] = {}
+    for stac_type, path in _ROOT_SCHEMAS.items():
+        root = {"$ref": f"{_STAC_BASE}{path}"}
+        validators[stac_type] = screened(
+            Draft7Validator(root, registry=registry),
+            compile_rust(root, rust_registry, draft7=True),
+        )
 
     def _validate(data: dict[str, Any]) -> list[SchemaError]:
         stac_type = data.get("type")
@@ -78,12 +89,14 @@ def default_validator() -> Validator:
                     json_pointer="/type",
                 )
             ]
-        return [describe(error) for error in sorted(validator.iter_errors(data), key=str)]
+        return validator(data)
 
     return _validate
 
 
-def validate_structural(graph: CatalogGraph, validator: Validator | None = None) -> list[Finding]:
+def validate_structural(
+    graph: CatalogGraph, validator: Validator | None = None, *, jobs: int = 1
+) -> list[Finding]:
     """Validate every catalog, collection, and item against STAC 1.1.0 core.
 
     Returns ``PTL-STR-001`` errors for each structural failure, each carrying
@@ -91,7 +104,18 @@ def validate_structural(graph: CatalogGraph, validator: Validator | None = None)
     (``jsonschema`` missing) or a call fails, returns a single ``PTL-STR-000``
     warning instead of failing the run — a systemic failure is reported once,
     not once per object.
+
+    ``jobs`` above 1 validates the objects on that many processes (see
+    :mod:`rashid._parallel`). An injected ``validator`` always runs in this
+    process.
     """
+    if validator is None and jobs > 1:
+        validator = precomputed(
+            default_validator,
+            {},
+            [(node.data,) for node in graph.iter(*_STRUCTURAL_KINDS) if node.parse_error is None],
+            jobs,
+        )
     if validator is None:
         try:
             validator = default_validator()

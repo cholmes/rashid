@@ -32,6 +32,7 @@ from importlib import resources
 from typing import Any
 
 from rashid._jsonschema import SchemaError, fetch_schema
+from rashid._parallel import precomputed
 from rashid.catalog import CatalogGraph, Kind
 from rashid.model import Finding, Severity
 from rashid.rules.conformance import declared_schema_uris
@@ -118,18 +119,17 @@ def validator_from_schema(schema: dict[str, Any]) -> Validator:
     ``jsonschema`` is imported lazily because the metadata pass never needs it.
     Draft-07 is pinned because the published Portolan schema declares
     ``$schema`` draft-07. Error narrowing (the oneOf discriminator dance) lives
-    in :func:`rashid._jsonschema.describe`, shared with the structural pass.
+    in :func:`rashid._jsonschema.describe`, shared with the structural pass,
+    and :func:`rashid._jsonschema.screened` skips it for a valid object.
     """
     from jsonschema import Draft7Validator
 
-    from rashid._jsonschema import describe
+    from rashid._jsonschema import compile_rust, screened, specifications_rust_registry
 
-    validator = Draft7Validator(schema)
-
-    def _validate(data: dict[str, Any]) -> list[SchemaError]:
-        return [describe(error) for error in sorted(validator.iter_errors(data), key=str)]
-
-    return _validate
+    return screened(
+        Draft7Validator(schema),
+        compile_rust(schema, specifications_rust_registry(), draft7=True),
+    )
 
 
 def default_validator(
@@ -160,6 +160,7 @@ def validate_schema(
     schema_uri: str | None = None,
     *,
     allow_network: bool = False,
+    jobs: int = 1,
 ) -> list[Finding]:
     """Validate every catalog, collection, and item against the profile schema.
 
@@ -169,11 +170,28 @@ def validate_schema(
     validator is unavailable (missing package, unbundled version offline, or a
     failed fetch), returns a single ``PTL-SCH-000`` warning instead of failing
     the run — a systemic failure is reported once, not once per object.
+
+    ``jobs`` above 1 validates the objects on that many processes (see
+    :mod:`rashid._parallel`). The schema is built here first, so a schema that
+    cannot load is reported before any worker starts, and each worker fetches
+    an unbundled schema again. An injected ``validator`` always runs in this
+    process.
     """
     if validator is None:
         uri = schema_uri if schema_uri is not None else _schema_uri_for(graph)
         try:
             validator = default_validator(uri, allow_network=allow_network)
+            if jobs > 1:
+                validator = precomputed(
+                    default_validator,
+                    {"schema_uri": uri, "allow_network": allow_network},
+                    [
+                        (node.data,)
+                        for node in graph.iter(*_SCHEMA_KINDS)
+                        if node.parse_error is None
+                    ],
+                    jobs,
+                )
         except ImportError:
             return [
                 Finding(

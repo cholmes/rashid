@@ -10,12 +10,22 @@ script's ``--check`` stays an honest diff; the ``$id`` normalization that
 resolution needs (upstream ``common.json`` ships a malformed ``$id``) happens
 here at load time. ``jsonschema`` is imported lazily by the callers, never at
 module import — the metadata pass must stay stdlib-only.
+
+Python ``jsonschema`` takes about a millisecond per STAC object, so a catalog
+of 100,000 items spends minutes in it. :func:`screened` puts ``jsonschema-rs``
+in front: the Rust validator answers "is this object valid?", and only an
+object it rejects goes through ``jsonschema`` and :func:`describe`. Most objects
+are valid, so most skip Python, and every message still comes from the same
+``jsonschema`` error tree, so the findings do not change.
+``tests/unit/test_jsonschema_rust_parity.py`` holds the two engines to the
+same verdict on every fixture.
 """
 
 from __future__ import annotations
 
 import json
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import resources
@@ -65,6 +75,10 @@ def fetch_schema(schema_uri: str) -> dict[str, Any]:
     return schema
 
 
+# One object's raw JSON in, its schema errors out; empty when it is valid.
+Validator = Callable[[dict[str, Any]], list[SchemaError]]
+
+
 def _iter_vendored(node: Traversable, prefix: str = "") -> list[tuple[str, str]]:
     """Yield (relative-path, text) for every vendored ``.json`` under ``node``."""
     out: list[tuple[str, str]] = []
@@ -88,13 +102,117 @@ def _registry_over(trees: tuple[tuple[Traversable, str], ...]) -> Registry:
     from referencing import Registry, Resource
 
     registry: Registry = Registry()
+    for url, contents in _vendored_resources(trees):
+        registry = registry.with_resource(uri=url, resource=Resource.from_contents(contents))
+    return registry.crawl()
+
+
+def _vendored_resources(
+    trees: tuple[tuple[Traversable, str], ...],
+) -> list[tuple[str, dict[str, Any]]]:
+    """(URL, contents) for every vendored file, ``$id`` normalized to the URL."""
+    out: list[tuple[str, dict[str, Any]]] = []
     for root, base in trees:
         for rel_path, text in _iter_vendored(root):
             url = f"{base}{rel_path}"
             contents: dict[str, Any] = json.loads(text)
             contents["$id"] = url
-            registry = registry.with_resource(uri=url, resource=Resource.from_contents(contents))
-    return registry.crawl()
+            out.append((url, contents))
+    return out
+
+
+def _rust_registry_over(trees: tuple[tuple[Traversable, str], ...]) -> Any:
+    """The ``jsonschema_rs.Registry`` twin of :func:`_registry_over`.
+
+    ``referencing`` resolves the JSON Schema meta-schemas from
+    ``jsonschema_specifications`` without being told; the Rust registry needs
+    them listed. The STAC Collection schema ``$ref``s the draft-07 one.
+    """
+    import jsonschema_rs
+    from jsonschema_specifications import REGISTRY as SPECIFICATIONS
+
+    resources_: list[tuple[str, Any]] = list(_vendored_resources(trees))
+    resources_.extend((uri, SPECIFICATIONS[uri].contents) for uri in SPECIFICATIONS)
+    return jsonschema_rs.Registry(resources_)
+
+
+def _stac_trees() -> tuple[tuple[Traversable, str], ...]:
+    schemas = resources.files("rashid").joinpath("_schemas")
+    return (
+        (schemas.joinpath("stac").joinpath(STAC_VERSION), _STAC_BASE),
+        (schemas.joinpath("geojson"), _GEOJSON_BASE),
+    )
+
+
+def _extension_trees() -> tuple[tuple[Traversable, str], ...]:
+    schemas = resources.files("rashid").joinpath("_schemas")
+    trees: list[tuple[Traversable, str]] = [(schemas.joinpath("geojson"), _GEOJSON_BASE)]
+    for version_dir in schemas.joinpath("stac").iterdir():
+        if version_dir.is_dir():
+            trees.append((version_dir, f"{_STAC_HOST}v{version_dir.name}/"))
+    extensions = schemas.joinpath("extensions")
+    if extensions.is_dir():
+        for host_dir in extensions.iterdir():
+            if host_dir.is_dir():
+                trees.append((host_dir, f"https://{host_dir.name}/"))
+    return tuple(trees)
+
+
+@lru_cache(maxsize=1)
+def stac_rust_registry() -> Any:
+    """The Rust registry over the same closure as :func:`stac_registry`."""
+    return _rust_registry_over(_stac_trees())
+
+
+@lru_cache(maxsize=1)
+def extension_rust_registry() -> Any:
+    """The Rust registry over the same trees as :func:`extension_registry`."""
+    return _rust_registry_over(_extension_trees())
+
+
+@lru_cache(maxsize=1)
+def specifications_rust_registry() -> Any:
+    """The meta-schemas only: what a bare ``jsonschema`` validator resolves."""
+    return _rust_registry_over(())
+
+
+def compile_rust(schema: dict[str, Any], registry: Any, *, draft7: bool = False) -> Any | None:
+    """Compile ``schema`` with ``jsonschema-rs``, or None when it cannot.
+
+    The options make it judge what the ``jsonschema`` validator beside it
+    judges. ``validate_formats=False`` because rashid never passes
+    ``jsonschema`` a format checker. ``offline=True`` because the
+    ``referencing`` registries have no retriever. ``draft7`` pins the dialect
+    where the Python side pins ``Draft7Validator``; otherwise the dialect comes
+    from ``$schema``, as ``jsonschema.validators.validator_for`` picks it.
+
+    Rust resolves every ``$ref`` up front, where ``jsonschema`` resolves them
+    lazily. A schema Rust cannot compile therefore returns None, and the
+    caller runs ``jsonschema`` alone, which fails the way it always has.
+    """
+    import jsonschema_rs
+
+    build = jsonschema_rs.Draft7Validator if draft7 else jsonschema_rs.validator_for
+    try:
+        return build(schema, registry=registry, validate_formats=False, offline=True)
+    except Exception:  # noqa: BLE001 - any compile failure falls back to jsonschema
+        return None
+
+
+def screened(python_validator: Any, rust_validator: Any | None) -> Validator:
+    """A validator that asks Rust first and ``jsonschema`` only on a rejection.
+
+    ``rust_validator`` may be None, and then every object goes to
+    ``jsonschema``. Errors from ``jsonschema`` are raised as before, so a
+    ``$ref`` that only resolves lazily still surfaces from ``iter_errors``.
+    """
+
+    def _validate(data: dict[str, Any]) -> list[SchemaError]:
+        if rust_validator is not None and rust_validator.is_valid(data):
+            return []
+        return [describe(error) for error in sorted(python_validator.iter_errors(data), key=str)]
+
+    return _validate
 
 
 @lru_cache(maxsize=1)
@@ -104,13 +222,7 @@ def stac_registry() -> Registry:
     Scoped to what the structural pass resolves. Cached: the vendored closure
     never changes at runtime.
     """
-    schemas = resources.files("rashid").joinpath("_schemas")
-    return _registry_over(
-        (
-            (schemas.joinpath("stac").joinpath(STAC_VERSION), _STAC_BASE),
-            (schemas.joinpath("geojson"), _GEOJSON_BASE),
-        )
-    )
+    return _registry_over(_stac_trees())
 
 
 @lru_cache(maxsize=1)
@@ -124,17 +236,7 @@ def extension_registry() -> Registry:
     file's URL from its path. A schema vendored by a future spec sync resolves
     with no change here.
     """
-    schemas = resources.files("rashid").joinpath("_schemas")
-    trees: list[tuple[Traversable, str]] = [(schemas.joinpath("geojson"), _GEOJSON_BASE)]
-    for version_dir in schemas.joinpath("stac").iterdir():
-        if version_dir.is_dir():
-            trees.append((version_dir, f"{_STAC_HOST}v{version_dir.name}/"))
-    extensions = schemas.joinpath("extensions")
-    if extensions.is_dir():
-        for host_dir in extensions.iterdir():
-            if host_dir.is_dir():
-                trees.append((host_dir, f"https://{host_dir.name}/"))
-    return _registry_over(tuple(trees))
+    return _registry_over(_extension_trees())
 
 
 @lru_cache(maxsize=1)

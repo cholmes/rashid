@@ -97,6 +97,14 @@ def main() -> None:
     "the check that every link target exists there.",
 )
 @click.option(
+    "--jobs",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Processes for the structural, extension, and schema passes. "
+    "The findings are the same for any value.",
+)
+@click.option(
     "--all",
     "list_all",
     is_flag=True,
@@ -119,6 +127,7 @@ def check(
     data_scope: str,
     live: bool,
     live_base_url: str | None,
+    jobs: int,
     list_all: bool,
     force_summary: bool,
 ) -> None:
@@ -142,6 +151,7 @@ def check(
         data_reader_factory=LocalOnlyReader if data_scope == "local" else None,
         live=live,
         live_base_url=live_base_url,
+        jobs=jobs,
     )
     if as_json:
         click.echo(json_module.dumps(report.to_dict(), indent=2))

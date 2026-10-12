@@ -35,11 +35,14 @@ from typing import Any
 
 from rashid._jsonschema import (
     SchemaError,
-    describe,
+    compile_rust,
     extension_registry,
+    extension_rust_registry,
     fetch_schema,
+    screened,
     vendored_extension_schemas,
 )
+from rashid._parallel import precomputed
 from rashid.catalog import CatalogGraph, Kind, Node
 from rashid.model import Finding, Severity
 from rashid.rules.conformance import (
@@ -85,10 +88,16 @@ def _compile(schema: dict[str, Any]) -> Any:
     roots are spec-driven and a future one need not be. Hardcoding the dialect
     is the bug stac-check #159 reports upstream; there is no reason to repeat
     it here.
+
+    The result is :func:`rashid._jsonschema.screened`: ``jsonschema-rs``
+    passes a valid object, and ``jsonschema`` explains a rejected one.
     """
     from jsonschema.validators import validator_for
 
-    return validator_for(schema)(schema, registry=extension_registry())
+    return screened(
+        validator_for(schema)(schema, registry=extension_registry()),
+        compile_rust(schema, extension_rust_registry()),
+    )
 
 
 def default_validator(*, allow_network: bool = False) -> Validator:
@@ -127,11 +136,11 @@ def default_validator(*, allow_network: bool = False) -> Validator:
                     raise SchemaUnavailable(str(exc)) from exc
             validator = compiled[schema_uri] = _compile(schema)
         try:
-            errors = sorted(validator.iter_errors(data), key=str)
+            errors: list[SchemaError] = validator(data)
         except Unresolvable as exc:
             failed[schema_uri] = f"unresolvable $ref: {exc}"
             raise SchemaUnavailable(failed[schema_uri]) from exc
-        return [describe(error) for error in errors]
+        return errors
 
     return _validate
 
@@ -148,11 +157,19 @@ def _declared(node: Node) -> list[str]:
     return [uri for uri in declared if isinstance(uri, str) and not SCHEMA_URI_PATTERN.match(uri)]
 
 
+def _validated(uri: str, *, allow_network: bool) -> bool:
+    """Whether the pass validates ``uri`` at all, or only counts it as PTL-EXT-002."""
+    if allow_network:
+        return True
+    return (registered_extension(uri) or registered_at_other_version(uri)) is not None
+
+
 def validate_extensions(
     graph: CatalogGraph,
     validator: Validator | None = None,
     *,
     allow_network: bool = False,
+    jobs: int = 1,
 ) -> list[Finding]:
     """Validate every object against the extension schemas it declares.
 
@@ -165,7 +182,24 @@ def validate_extensions(
     and the pass goes on. If the validator cannot be built at all, or fails in
     a way that is not specific to one URI, returns a single ``PTL-EXT-000``
     warning so the offline metadata findings still surface.
+
+    ``jobs`` above 1 validates the (object, URI) pairs on that many processes
+    (see :mod:`rashid._parallel`). Each worker fetches an unvendored schema
+    once for itself. An injected ``validator`` always runs in this process.
     """
+    if validator is None and jobs > 1:
+        validator = precomputed(
+            default_validator,
+            {"allow_network": allow_network},
+            [
+                (node.data, uri)
+                for node in graph.iter(*_EXTENSION_KINDS)
+                if node.parse_error is None
+                for uri in _declared(node)
+                if _validated(uri, allow_network=allow_network)
+            ],
+            jobs,
+        )
     if validator is None:
         try:
             validator = default_validator(allow_network=allow_network)
@@ -188,10 +222,10 @@ def validate_extensions(
         if node.parse_error is not None:
             continue
         for uri in _declared(node):
-            entry = registered_extension(uri) or registered_at_other_version(uri)
-            if entry is None and not allow_network:
+            if not _validated(uri, allow_network=allow_network):
                 unvalidated[uri] = unvalidated.get(uri, 0) + 1
                 continue
+            entry = registered_extension(uri) or registered_at_other_version(uri)
             label = f"{entry[0]} {entry[1]}" if entry is not None else uri
             try:
                 errors = validator(node.data, uri)

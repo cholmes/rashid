@@ -124,22 +124,23 @@ def _optional_passes(
     live: bool,
     live_prober: LiveProber | None,
     live_base_url: str | None,
+    jobs: int,
 ) -> list[Finding]:
     """Run the structural, extension, schema, data, and live passes, honouring disable ids."""
     findings: list[Finding] = []
     if structural and STR_INVALID not in config.disabled:
-        findings.extend(validate_structural(graph, structural_validator))
+        findings.extend(validate_structural(graph, structural_validator, jobs=jobs))
     if extensions and EXT_INVALID not in config.disabled:
         findings.extend(
             f
             for f in validate_extensions(
-                graph, extensions_validator, allow_network=schema_allow_network
+                graph, extensions_validator, allow_network=schema_allow_network, jobs=jobs
             )
             if f.rule_id not in config.disabled
         )
     if schema and SCH_INVALID not in config.disabled:
         findings.extend(
-            validate_schema(graph, schema_validator, allow_network=schema_allow_network)
+            validate_schema(graph, schema_validator, allow_network=schema_allow_network, jobs=jobs)
         )
     if data and not _DATA_RULE_IDS <= config.disabled:
         findings.extend(
@@ -174,6 +175,7 @@ def validate(
     live: bool = False,
     live_prober: LiveProber | None = None,
     live_base_url: str | None = None,
+    jobs: int = 1,
 ) -> Report:
     """Validate a local Portolan catalog tree.
 
@@ -237,7 +239,15 @@ def validate(
     Disabling every ``PTL-LIV-00x`` rule via ``config`` skips the pass;
     disabling a subset just silences those findings. ``live_prober`` injects an
     alternate prober, chiefly for offline testing.
+
+    ``jobs`` sets how many processes run the structural, extension, and schema
+    passes, which validate each object on its own (see :mod:`rashid._parallel`).
+    The metadata pass reads the whole graph and stays in this process. The
+    report is the same for any ``jobs``. A pass given an injected validator
+    runs it in this process whatever ``jobs`` says.
     """
+    if jobs < 1:
+        raise ValueError(f"jobs must be at least 1, got {jobs}")
     if rules is None:
         from rashid.rules import DEFAULT_RULES
 
@@ -328,6 +338,7 @@ def validate(
             live=live,
             live_prober=live_prober,
             live_base_url=live_base_url,
+            jobs=jobs,
         )
     )
 

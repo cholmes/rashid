@@ -76,12 +76,26 @@ class CatalogGraph:
     ``dir_listing`` maps every scanned directory (relative POSIX path, ``.``
     for the root) to the set of filenames it contains, so required-file rules
     can check existence without touching disk again.
+
+    The containment queries (:meth:`parent_of`, :meth:`children_of`,
+    :meth:`items_of`) are answered from indexes built on first use, so the
+    graph must not change after :meth:`load`. Without them, each call scans
+    every node, and a catalog of 100,000 items under 100 collections costs
+    tens of millions of path lookups.
     """
 
     root_path: Path
     nodes: dict[PurePosixPath, Node] = field(default_factory=dict)
     dir_listing: dict[PurePosixPath, set[str]] = field(default_factory=dict)
     _translation_roots: list[Node] | None = field(default=None, repr=False, compare=False)
+    _sorted_paths: list[PurePosixPath] | None = field(default=None, repr=False, compare=False)
+    _parents: dict[tuple[PurePosixPath, Kind], Node | None] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    _children: dict[PurePosixPath, list[Node]] | None = field(
+        default=None, repr=False, compare=False
+    )
+    _items: dict[PurePosixPath, list[Node]] | None = field(default=None, repr=False, compare=False)
 
     @property
     def root(self) -> Node | None:
@@ -209,7 +223,9 @@ class CatalogGraph:
 
     def iter(self, *kinds: Kind) -> Iterator[Node]:
         """Yield nodes of the given kinds (all nodes when none given)."""
-        for path in sorted(self.nodes):
+        if self._sorted_paths is None:
+            self._sorted_paths = sorted(self.nodes)
+        for path in self._sorted_paths:
             node = self.nodes[path]
             if not kinds or node.kind in kinds:
                 yield node
@@ -247,6 +263,12 @@ class CatalogGraph:
         directly in the collection directory or in a per-item subdirectory).
         The root catalog has no parent.
         """
+        key = (node.path, node.kind)
+        if key not in self._parents:
+            self._parents[key] = self._find_parent(node)
+        return self._parents[key]
+
+    def _find_parent(self, node: Node) -> Node | None:
         if node.path == ROOT_CATALOG:
             return None
         start = node.path.parent
@@ -282,7 +304,13 @@ class CatalogGraph:
 
     def children_of(self, node: Node) -> list[Node]:
         """Objects whose containment parent is ``node``."""
-        return [n for n in self.iter() if self.parent_of(n) is node]
+        if self._children is None:
+            self._children = {}
+            for n in self.iter():
+                parent = self.parent_of(n)
+                if parent is not None:
+                    self._children.setdefault(parent.path, []).append(n)
+        return list(self._children.get(node.path, [])) if self._owns(node) else []
 
     def items_of(self, node: Node) -> list[Node]:
         """The items ``node`` owns, across any catalogs organizing them.
@@ -294,6 +322,18 @@ class CatalogGraph:
         so a nested collection keeps its own items rather than lending them
         upward.
         """
-        return [
-            n for n in self.iter() if n.kind == "item" and self.enclosing_collection_of(n) is node
-        ]
+        if self._items is None:
+            self._items = {}
+            for n in self.iter("item"):
+                collection = self.enclosing_collection_of(n)
+                if collection is not None:
+                    self._items.setdefault(collection.path, []).append(n)
+        return list(self._items.get(node.path, [])) if self._owns(node) else []
+
+    def _owns(self, node: Node) -> bool:
+        """True when ``node`` is this graph's own node, not a copy with its path.
+
+        The indexes are keyed by path, but containment compares nodes by
+        identity, so a node from another graph has no children here.
+        """
+        return self.nodes.get(node.path) is node
