@@ -4,6 +4,7 @@
 
 - **check**: accept the https URL of a published catalog; rashid follows the links from the root, runs every pass over the fetched tree, and turns the live pass on with the URL as the publish base; `PTL-GEN-002` names what a crawl cannot see (#160)
 - **live**: read the publish base from the root catalog's absolute `self` link when `--live-base-url` is absent, and report a `self` link that disagrees with the base as `PTL-LIV-007` (#160)
+- **rules**: require every collection to refer to its primary data (`PTL-AST-007`, PORTO-CORE-082) and every item to carry a `data` asset (`PTL-AST-008`, PORTO-CORE-083)
 
 ## v0.2.0 (2026-10-12)
 
