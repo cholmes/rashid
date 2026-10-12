@@ -77,9 +77,9 @@ class CatalogGraph:
     for the root) to the set of filenames it contains, so required-file rules
     can check existence without touching disk again.
 
-    The containment queries (:meth:`parent_of`, :meth:`children_of`,
-    :meth:`items_of`) are answered from indexes built on first use, so the
-    graph must not change after :meth:`load`. Without them, each call scans
+    :meth:`iter` and the containment queries (:meth:`parent_of`,
+    :meth:`children_of`, :meth:`items_of`) are answered from indexes built on
+    first use, so the graph must not change after :meth:`load`. Without them, each call scans
     every node, and a catalog of 100,000 items under 100 collections costs
     tens of millions of path lookups.
     """
@@ -88,7 +88,9 @@ class CatalogGraph:
     nodes: dict[PurePosixPath, Node] = field(default_factory=dict)
     dir_listing: dict[PurePosixPath, set[str]] = field(default_factory=dict)
     _translation_roots: list[Node] | None = field(default=None, repr=False, compare=False)
-    _sorted_paths: list[PurePosixPath] | None = field(default=None, repr=False, compare=False)
+    _by_kinds: dict[frozenset[Kind], list[Node]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
     _parents: dict[tuple[PurePosixPath, Kind], Node | None] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -222,13 +224,16 @@ class CatalogGraph:
         return graph
 
     def iter(self, *kinds: Kind) -> Iterator[Node]:
-        """Yield nodes of the given kinds (all nodes when none given)."""
-        if self._sorted_paths is None:
-            self._sorted_paths = sorted(self.nodes)
-        for path in self._sorted_paths:
-            node = self.nodes[path]
-            if not kinds or node.kind in kinds:
-                yield node
+        """Yield nodes of the given kinds (all nodes when none given), sorted by path."""
+        key = frozenset(kinds)
+        selected = self._by_kinds.get(key)
+        if selected is None:
+            selected = self._by_kinds[key] = [
+                self.nodes[path]
+                for path in sorted(self.nodes)
+                if not kinds or self.nodes[path].kind in kinds
+            ]
+        yield from selected
 
     def file_exists(self, rel_path: PurePosixPath) -> bool:
         """True when the walk saw a file at this relative path."""

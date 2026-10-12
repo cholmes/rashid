@@ -49,12 +49,6 @@ rashid check path/to/catalog \
 
 Use `--json` for a machine-readable report.
 
-Use `--jobs N` to run the structural, extension, and schema passes on N processes. The report is the same for any N. The metadata pass reads the whole catalog and runs on one process.
-
-```bash
-rashid check path/to/catalog --no-data --jobs 4
-```
-
 ## Read the Report
 
 Each finding contains a rule ID, severity, message, and file path. MUST requirements produce errors, and SHOULD requirements produce warnings.

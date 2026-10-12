@@ -42,7 +42,6 @@ from rashid._jsonschema import (
     screened,
     vendored_extension_schemas,
 )
-from rashid._parallel import precomputed
 from rashid.catalog import CatalogGraph, Kind, Node
 from rashid.model import Finding, Severity
 from rashid.rules.conformance import (
@@ -157,19 +156,11 @@ def _declared(node: Node) -> list[str]:
     return [uri for uri in declared if isinstance(uri, str) and not SCHEMA_URI_PATTERN.match(uri)]
 
 
-def _validated(uri: str, *, allow_network: bool) -> bool:
-    """Whether the pass validates ``uri`` at all, or only counts it as PTL-EXT-002."""
-    if allow_network:
-        return True
-    return (registered_extension(uri) or registered_at_other_version(uri)) is not None
-
-
 def validate_extensions(
     graph: CatalogGraph,
     validator: Validator | None = None,
     *,
     allow_network: bool = False,
-    jobs: int = 1,
 ) -> list[Finding]:
     """Validate every object against the extension schemas it declares.
 
@@ -182,24 +173,7 @@ def validate_extensions(
     and the pass goes on. If the validator cannot be built at all, or fails in
     a way that is not specific to one URI, returns a single ``PTL-EXT-000``
     warning so the offline metadata findings still surface.
-
-    ``jobs`` above 1 validates the (object, URI) pairs on that many processes
-    (see :mod:`rashid._parallel`). Each worker fetches an unvendored schema
-    once for itself. An injected ``validator`` always runs in this process.
     """
-    if validator is None and jobs > 1:
-        validator = precomputed(
-            default_validator,
-            {"allow_network": allow_network},
-            [
-                (node.data, uri)
-                for node in graph.iter(*_EXTENSION_KINDS)
-                if node.parse_error is None
-                for uri in _declared(node)
-                if _validated(uri, allow_network=allow_network)
-            ],
-            jobs,
-        )
     if validator is None:
         try:
             validator = default_validator(allow_network=allow_network)
@@ -222,10 +196,10 @@ def validate_extensions(
         if node.parse_error is not None:
             continue
         for uri in _declared(node):
-            if not _validated(uri, allow_network=allow_network):
+            entry = registered_extension(uri) or registered_at_other_version(uri)
+            if entry is None and not allow_network:
                 unvalidated[uri] = unvalidated.get(uri, 0) + 1
                 continue
-            entry = registered_extension(uri) or registered_at_other_version(uri)
             label = f"{entry[0]} {entry[1]}" if entry is not None else uri
             try:
                 errors = validator(node.data, uri)
