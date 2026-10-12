@@ -756,16 +756,29 @@ def test_without_base_url_no_link_is_probed(catalog: CatalogBuilder) -> None:
     assert findings == []
 
 
-def test_link_probes_run_in_sorted_url_order(catalog: CatalogBuilder) -> None:
+def test_link_findings_follow_sorted_url_order(catalog: CatalogBuilder) -> None:
+    """The HEADs after a host's first one run in parallel, in any order.
+
+    Only the first request is sent alone, so it alone has a fixed place. The
+    findings must not depend on which request finished first: they follow
+    sorted URL order, and each URL is asked once.
+    """
     graph = _nested_tree(catalog)
-    prober = StatusProber()
-    validate_live(graph, prober, base_url=_BASE)
     asset_urls = {
         t.url for targets in live_mod._targets_by_host(graph, _BASE).values() for t in targets
     }
+    base, _named = live_mod._resolve_base(graph, _BASE)
+    link_urls = [t.url for t in live_mod._link_targets(graph, base)]
+    assert link_urls == sorted(link_urls) and len(link_urls) > 2
+    prober = StatusProber(dict.fromkeys(link_urls, 404))
+
+    findings = validate_live(graph, prober, base_url=_BASE)
+
     link_calls = [u for u in prober.head_calls if u not in asset_urls]
-    assert link_calls == sorted(link_calls)
-    assert len(link_calls) == len(set(link_calls))
+    assert link_calls[0] == link_urls[0]
+    assert sorted(link_calls) == link_urls
+    reported = [re.search(r"HEAD (\S+) returned", f.message)[1] for f in _link_findings(findings)]
+    assert reported == link_urls
 
 
 def test_link_target_shared_with_an_asset_is_headed_once(catalog: CatalogBuilder) -> None:
