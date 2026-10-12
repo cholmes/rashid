@@ -70,15 +70,18 @@ Use `--all` to list every finding. Use `--summary` to group any report by rule. 
 
 ## Choose Additional Checks
 
-rashid provides five separate validation passes:
+rashid provides six separate validation passes:
 
 - **Metadata** checks Portolan requirements in catalog JSON.
 - **Structural** checks STAC 1.1.0 core structure offline.
+- **Extension** checks each object against the schemas of the STAC extensions it declares, offline.
 - **Schema** checks each object against the packaged Portolan profile schema.
 - **Data** reads asset bytes and verifies checksums, sizes, formats, and extents.
 - **Live hosting** checks HTTP range support and CORS on remote servers.
 
-Metadata, structural, and data checks run by default. The live hosting pass also runs by default for a catalog URL. Use `--schema` as a cross-check against the published profile schema. Use `--live` to run the hosting checks on a directory.
+Metadata, structural, extension, and data checks run by default. The live hosting pass also runs by default for a catalog URL. Use `--schema` as a cross-check against the published profile schema. Use `--live` to run the hosting checks on a directory.
+
+The extension pass uses the versions that the profile's extension registry pins. rashid packages those schemas, so a catalog at the pinned versions needs no network. A catalog that declares an older version of a registered extension is checked against that version's schema, which rashid fetches over https. rashid reports an extension outside the registry as an info finding rather than validating it. Use `--schema-allow-network` to fetch and check such a schema.
 
 If a pass cannot run, rashid reports a warning. It does not treat the skipped pass as successful.
 
@@ -96,7 +99,7 @@ for finding in report.errors:
     print(finding.message)
 ```
 
-`validate()` uses the same default passes as the command-line interface. Set `schema=True` or `live=True` to add those passes. For a URL, `live` is on unless you pass `live=False`.
+`validate()` uses the same default passes as the command-line interface. Set `schema=True` or `live=True` to add those passes. For a URL, `live` is on unless you pass `live=False`. Set `extensions=False` to skip the extension pass.
 
 Use `RulesConfig` to disable rules or change their severity.
 

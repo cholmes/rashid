@@ -71,6 +71,14 @@ def main() -> None:
     help="Run the STAC 1.1.0 structural pass against the bundled schemas (offline).",
 )
 @click.option(
+    "--extensions/--no-extensions",
+    "extensions",
+    default=True,
+    help="Validate every object against the schemas of the STAC extensions it "
+    "declares. Pinned versions use bundled schemas; an older version of a "
+    "registered extension is fetched over https.",
+)
+@click.option(
     "--schema/--no-schema",
     "schema",
     default=False,
@@ -79,7 +87,8 @@ def main() -> None:
 @click.option(
     "--schema-allow-network",
     is_flag=True,
-    help="Fetch a schema version this build does not bundle over https.",
+    help="Fetch a schema this build does not bundle over https: an unbundled "
+    "profile version, or an extension the registry does not pin.",
 )
 @click.option(
     "--data/--no-data",
@@ -126,6 +135,7 @@ def check(
     catalog: Path | str,
     as_json: bool,
     structural: bool,
+    extensions: bool,
     schema: bool,
     schema_allow_network: bool,
     data: bool,
@@ -156,6 +166,7 @@ def check(
     report = validate(
         catalog,
         structural=structural,
+        extensions=extensions,
         schema=schema,
         schema_allow_network=schema_allow_network,
         data=data,
